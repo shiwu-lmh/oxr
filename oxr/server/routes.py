@@ -1,5 +1,6 @@
 import json
 import logging
+from pathlib import Path
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -19,6 +20,31 @@ from oxr.server.queue.memory_store import MemoryTaskStore
 
 router = APIRouter()
 LOGGER = logging.getLogger(__name__)
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+SUPPORTED_UPLOAD_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+
+
+class UploadValidationError(ValueError):
+    def __init__(self, message: str, code: int):
+        super().__init__(message)
+        self.code = code
+
+
+async def _read_validated_upload(file: UploadFile) -> tuple[bytes, str]:
+    raw_name = (file.filename or "document").replace("\\", "/")
+    file_name = Path(raw_name).name or "document"
+    if Path(file_name).suffix.lower() not in SUPPORTED_UPLOAD_EXTENSIONS:
+        raise UploadValidationError("请上传 PDF 或支持的图片文件。", 415)
+    chunks = []
+    total = 0
+    while chunk := await file.read(1024 * 1024):
+        total += len(chunk)
+        if total > MAX_UPLOAD_BYTES:
+            raise UploadValidationError("文件不能超过 100 MiB。", 413)
+        chunks.append(chunk)
+    if not chunks:
+        raise UploadValidationError("上传文件为空。", 422)
+    return b"".join(chunks), file_name
 
 DEFAULT_OUTPUT_FORMATS = ["markdown", "json"]
 SUPPORTED_OUTPUT_FORMATS = {"markdown", "json"}
@@ -270,6 +296,10 @@ async def process_task_background(
     element_formats: Dict[str, str],
 ):
     await task_store.set_processing(task_id)
+
+    async def update_progress(progress: dict) -> None:
+        await task_store.set_progress(task_id, progress)
+
     try:
         result = await process_document(
             file_bytes,
@@ -278,6 +308,7 @@ async def process_task_background(
             keep_header_footer=keep_header_footer,
             model_options=model_options,
             element_formats=element_formats,
+            progress_callback=update_progress,
         )
         store_result = {
             "file_name": result["file_name"],
@@ -306,12 +337,17 @@ async def parse_sync(
     assert options is not None
 
     task_id = str(uuid.uuid4())
-    file_bytes = await file.read()
+    try:
+        file_bytes, file_name = await _read_validated_upload(file)
+    except UploadValidationError as error:
+        return _api_error(str(error), error.code)
+    finally:
+        await file.close()
     
     try:
         result = await process_document(
             file_bytes,
-            file.filename,
+            file_name,
             options.output_formats,
             keep_header_footer=options.keep_header_footer,
             model_options=options.model_options,
@@ -351,16 +387,21 @@ async def parse_async(
 
     task_store: MemoryTaskStore = request.app.state.task_store
     task_id = str(uuid.uuid4())
-    file_bytes = await file.read()
+    try:
+        file_bytes, file_name = await _read_validated_upload(file)
+    except UploadValidationError as error:
+        return _api_error(str(error), error.code)
+    finally:
+        await file.close()
     
-    await task_store.create(task_id, file.filename)
+    await task_store.create(task_id, file_name)
     
     background_tasks.add_task(
         process_task_background,
         task_store,
         task_id,
         file_bytes,
-        file.filename,
+        file_name,
         options.output_formats,
         options.keep_header_footer,
         options.model_options,
@@ -396,6 +437,7 @@ async def query_async(
             file_name=task.get("file_name"),
             result=task.get("result") if task["status"] == "success" else None,
             error=task.get("error"),
-            metadata=task.get("metadata", {})
+            metadata=task.get("metadata", {}),
+            progress=task.get("progress", {}),
         )
     )

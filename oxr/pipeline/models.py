@@ -32,3 +32,4 @@ class Block:
     text_after: str = ""
     generated_role: str = ""
     layout_score: float | None = None
+    heading_level: int = 1

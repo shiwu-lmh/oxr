@@ -3,19 +3,28 @@ from collections.abc import Mapping, Sequence
 from numbers import Real
 
 
-PROMPT_TEXT_RECOGNITION = """Recognize the content of the image."""
+_WATERMARK_GUIDANCE = """Ignore decorative watermarks and translucent background marks when transcribing. Preserve meaningful stamps and printed document text. Never guess characters fully covered by a watermark; leave unclear text unfilled."""
 
-PROMPT_FORMULA_RECOGNITION = """Recognize the formula of the image into KaTex format."""
+PROMPT_TEXT_RECOGNITION = f"""Transcribe the visible printed text in reading order. Preserve wording, line breaks, numbering, and text that actually repeats in the image. Mark unreadable text as [无法辨认]. Output only the transcription. {_WATERMARK_GUIDANCE}"""
 
-PROMPT_TABLE_RECOGNITION = """Recognize the table of the image into html format."""
+PROMPT_FORMULA_RECOGNITION = f"""Recognize the formula of the image into KaTex format. {_WATERMARK_GUIDANCE}"""
 
-PROMPT_CODE_RECOGNITION = """Recognize the code of the image into markdown code format."""
+PROMPT_TABLE_RECOGNITION = f"""Transcribe the visible table into HTML. Identify all actual column-header rows and place them in <thead>, using <th> cells; place data rows in <tbody> with <td> cells. Preserve every visible row and column in order, including empty cells, repeated source rows, and rowspan/colspan. Never omit an empty cell or shift later values. Mark unreadable text as [无法辨认]. Do not infer missing text or add rows. Return one complete balanced <table> using literal HTML tags; never HTML-escape tags such as <table> or put the whole table markup inside a cell. {_WATERMARK_GUIDANCE}"""
+
+PROMPT_TABLE_SEGMENT_RECOGNITION = f"""Transcribe only the data rows visible in this table segment. The textual header schema below describes the original table's columns; use it to preserve column order and merged-column structure, but do not output any header row. Include an empty cell for every blank grid cell so later values do not shift. Do not copy rows from other segments, invent rows, or repeat rows. Return one complete balanced <table> containing only this segment's <tbody> rows, using literal HTML tags; never HTML-escape tags or put the whole table markup inside a cell. {_WATERMARK_GUIDANCE}
+
+Header schema:
+{{header_schema}}"""
+
+PROMPT_TABLE_TEXT_RECOGNITION = f"""Transcribe visible printed words and values in this table, in reading order. Output one line per table row and separate cells with a tab. Preserve blank cells as [空白]. If you cannot finish every row in one response, still return the rows you can read in order; do not return an error message. Mark only unreadable text as [无法辨认]. Do not summarize, infer, or explain. If the table is split across images, transcribe only rows visible in this image. {_WATERMARK_GUIDANCE}"""
+
+PROMPT_CODE_RECOGNITION = f"""Recognize the code of the image into markdown code format. {_WATERMARK_GUIDANCE}"""
 
 PROMPT_LAYOUT_ANALYSIS = """Detect the layout of the input image, layout categories include [Caption,Footnote,Formula,Text,Page-footer,Page-header,Picture,Title,Table,Stamp,Chemical Structure,Code Block]. Box format is [x1,y1,x2,y2] and output box with reading order."""
 
-PROMPT_WHOLE_PAGE_RECOGNITION = """Recognize the whole page content of the image."""
+PROMPT_WHOLE_PAGE_RECOGNITION = f"""Recognize the whole page content of the image. {_WATERMARK_GUIDANCE}"""
 
-PROMPT_CHEMICAL_STRUCTURE_RECOGNITION = """Recognize the chemical structure of the image into SMILES."""
+PROMPT_CHEMICAL_STRUCTURE_RECOGNITION = f"""Recognize the chemical structure of the image into SMILES. {_WATERMARK_GUIDANCE}"""
 
 PROMPT_READING_ORDER = """
 Given the detected layout boxes below, output the reading order as a whitespace-separated permutation of 0-based box IDs only.

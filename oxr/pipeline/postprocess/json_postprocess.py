@@ -67,5 +67,7 @@ def serialize_final_blocks(
             ) if idx in source_ranges]
             region["start_line"] = min(span[0] for span in spans) if spans else None
             region["end_line"] = max(span[1] for span in spans) if spans else None
+        if block.type == BlockType.TITLE:
+            region["heading_level"] = max(1, min(6, int(block.heading_level)))
         serialized.append(region)
     return serialized, notes

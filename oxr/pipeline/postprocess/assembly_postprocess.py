@@ -19,7 +19,8 @@ def _use_tight_separator(previous: Block, current: Block) -> bool:
 
 def _block_to_markdown_part(block: Block, content: str) -> str:
     if block.type == BlockType.TITLE:
-        return f"# {content}\n"
+        level = max(1, min(6, int(block.heading_level)))
+        return f"{'#' * level} {content}\n"
     if block.type == BlockType.FORMULA:
         return f"$$\n{clean_formula_markdown_delimiters(content)}\n$$\n"
     if block.type in (

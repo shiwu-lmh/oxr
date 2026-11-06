@@ -121,10 +121,7 @@ class OXRModelClient:
             raise ValueError("An image is required for vision model calls.")
 
         content = [
-            {
-                "type": "image_url",
-                "image_url": {"url": self._image_to_data_url(image)},
-            },
+            {"type": "image_url", "image_url": {"url": self._image_to_data_url(image)}},
             {"type": "text", "text": prompt},
         ]
         resolved_options = resolve_model_options(model_options)
@@ -183,14 +180,48 @@ class OXRModelClient:
             model_options=model_options,
         )
 
-    async def recognize_table(self, image: np.ndarray, model_options: Optional[Dict[str, Any]] = None) -> str:
-        from oxr.model.prompts import PROMPT_TABLE_RECOGNITION
+    async def recognize_table(
+        self,
+        image: np.ndarray,
+        model_options: Optional[Dict[str, Any]] = None,
+        *,
+        header_schema: Optional[str] = None,
+        expected_columns: int | None = None,
+    ) -> str:
+        from oxr.model.prompts import (
+            PROMPT_TABLE_RECOGNITION,
+            PROMPT_TABLE_SEGMENT_RECOGNITION,
+        )
+        if header_schema:
+            prompt = PROMPT_TABLE_SEGMENT_RECOGNITION.format(header_schema=header_schema)
+        else:
+            prompt = PROMPT_TABLE_RECOGNITION
+        if expected_columns:
+            prompt += (
+                f" Every output row must have exactly {expected_columns} logical columns "
+                "after applying rowspan and colspan. Add empty cells at their correct grid positions."
+            )
         return await self._call_vision_model(
-            prompt=PROMPT_TABLE_RECOGNITION,
+            prompt=prompt,
             image=image,
             timeout=self.config.timeout,
             model_options=model_options,
         )
+
+    async def recognize_table_as_text(
+        self,
+        image: np.ndarray,
+        model_options: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Transcribe table rows as plain text when HTML structure cannot be recovered."""
+        from oxr.model.prompts import PROMPT_TABLE_TEXT_RECOGNITION
+        return await self._call_vision_model(
+            prompt=PROMPT_TABLE_TEXT_RECOGNITION,
+            image=image,
+            timeout=self.config.timeout,
+            model_options=model_options,
+        )
+
 
     async def recognize_code(self, image: np.ndarray, model_options: Optional[Dict[str, Any]] = None) -> str:
         from oxr.model.prompts import PROMPT_CODE_RECOGNITION
