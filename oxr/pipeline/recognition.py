@@ -1,4 +1,5 @@
 import asyncio
+import cv2
 import html
 import logging
 import math
@@ -31,6 +32,7 @@ from oxr.pipeline.table_segmentation import (
     repair_table_html_prefix, split_table_image, table_row_widths,
     split_table_image_with_bounds,
 )
+from oxr.pipeline.table_quality import table_quality_issues
 from oxr.utils.image import crop_image, resize_image
 from oxr.utils.table import _TableParser, strip_table_code_fence
 
@@ -274,17 +276,117 @@ async def _recognize_table_image(
 
     if depth and not preserve_image_tokens:
         logger.warning("Table block %s has an unreadable HTML slice; reading that slice as text.", block.idx)
-        return await _recognize_table_text_fallback(block, image, sem, model_options)
+        text_fallback = await _recognize_table_text_fallback(block, image, sem, model_options)
+        return text_fallback if text_fallback.strip() else raw
 
-    raise PipelineError(
-        f"Table recognition returned incomplete HTML for block {block.idx}.",
-        status_code=502,
-        public_message="表格分块识别仍未得到完整结构。请重试；未识别内容不会以图片代替。",
+    logger.warning(
+        "Table block %s did not produce a complete HTML table; returning the model's best-effort output.",
+        block.idx,
     )
+    return raw
 
 
 TABLE_MIN_SPLIT_HEIGHT = 96
 TABLE_RECOGNITION_CHUNK_HEIGHT = 360
+
+
+def _table_issue_score(issues: list[str]) -> int:
+    if "no_table_rows" in issues:
+        return 100 + len(issues)
+    return len(issues)
+
+
+async def _retry_table_views(
+    block: Block,
+    image: np.ndarray,
+    current_output: str,
+    sem: asyncio.Semaphore,
+    model_options: Optional[Dict[str, Any]],
+    *,
+    context_text: str = "",
+) -> str:
+    """Re-read suspicious tables from enhanced and quarter-turned source crops."""
+    issues = table_quality_issues(current_output, image.shape[0], context_text)
+    if not issues:
+        return current_output
+
+    logger.warning(
+        "Table block %s failed content checks (%s); retrying the same OXR model "
+        "on enhanced and rotated crops.",
+        block.idx, ", ".join(issues),
+    )
+    height, width = image.shape[:2]
+    scale = min(1.75, max(1.0, 2200 / max(height, width)))
+    if scale > 1.0:
+        enhanced = cv2.resize(
+            image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC,
+        )
+    else:
+        enhanced = image.copy()
+
+    candidates = [
+        ("high-resolution", enhanced),
+        ("rotated-90", np.rot90(enhanced, 1).copy()),
+        ("rotated-180", np.rot90(enhanced, 2).copy()),
+        ("rotated-270", np.rot90(enhanced, 3).copy()),
+    ]
+    best_output = current_output
+    best_score = _table_issue_score(issues)
+    for label, candidate in candidates:
+        try:
+            recognized = await _recognize_table_view(
+                block, candidate, sem, model_options,
+            )
+        except (PipelineError, ValueError) as error:
+            logger.warning(
+                "Table block %s %s retry failed (%s).",
+                block.idx, label, type(error).__name__,
+            )
+            continue
+        candidate_issues = table_quality_issues(
+            recognized, candidate.shape[0], context_text,
+        )
+        score = _table_issue_score(candidate_issues)
+        logger.info(
+            "Table block %s %s retry quality score=%d issues=%s.",
+            block.idx, label, score, ", ".join(candidate_issues) or "none",
+        )
+        if score < best_score:
+            best_output = recognized
+            best_score = score
+        if score == 0:
+            return recognized
+
+    return best_output
+
+
+async def _recognize_table_view(
+    block: Block,
+    image: np.ndarray,
+    sem: asyncio.Semaphore,
+    model_options: Optional[Dict[str, Any]],
+) -> str:
+    """Recognize a recovery view in row-aligned chunks when it is long."""
+    chunks = split_table_image_with_bounds(
+        image, max_height=TABLE_RECOGNITION_CHUNK_HEIGHT,
+    )
+    if len(chunks) <= 1:
+        return await _recognize_table_image(block, image, sem, model_options)
+
+    logger.info(
+        "Table block %s recovery view split into %d row-aligned chunks.",
+        block.idx, len(chunks),
+    )
+    responses: list[str] = []
+    header_schema: Optional[str] = None
+    for chunk, _, _ in chunks:
+        response = await _recognize_table_image(
+            block, chunk, sem, model_options, header_schema=header_schema,
+        )
+        responses.append(response)
+        if header_schema is None:
+            header_schema = extract_table_header_schema(response)
+    return combine_table_chunks(responses)
 
 async def _recognize_table_text_fallback(
     block: Block,
@@ -296,12 +398,19 @@ async def _recognize_table_text_fallback(
     config = settings.oxr_model
 
     async def recognize_piece(piece: np.ndarray, depth: int = 0) -> List[str]:
-        async with sem:
-            output = await _request_with_retries(
-                lambda: model_client.recognize_table_as_text(piece, model_options),
-                block=block,
-                attempts=config.retry_times,
-                timeout=config.timeout,
+        output = ""
+        try:
+            async with sem:
+                output = await _request_with_retries(
+                    lambda: model_client.recognize_table_as_text(piece, model_options),
+                    block=block,
+                    attempts=config.retry_times,
+                    timeout=config.timeout,
+                )
+        except PipelineError as error:
+            logger.warning(
+                "Table block %s text OCR failed for a %dpx crop (%s); trying smaller crops.",
+                block.idx, piece.shape[0], type(error).__name__,
             )
         if output.strip() and _finish_reason(output) != "length":
             return [output.strip()]
@@ -314,11 +423,11 @@ async def _recognize_table_text_fallback(
                     block.idx,
                 )
                 return [output.strip()]
-            raise PipelineError(
-                f"Text fallback for table block {block.idx} returned no content.",
-                status_code=502,
-                public_message="表格识别未返回内容。",
+            logger.warning(
+                "Table block %s text OCR returned no content at the minimum crop; skipping this empty crop.",
+                block.idx,
             )
+            return []
 
         target_height = max(TABLE_MIN_SPLIT_HEIGHT, height // 2)
         smaller = split_table_image(piece, max_height=target_height)
@@ -336,7 +445,9 @@ async def _recognize_table_text_fallback(
         results: List[str] = []
         for child in smaller:
             results.extend(await recognize_piece(child, depth + 1))
-        return results
+        # Prefer finer child OCR when it produced text; if every child was
+        # empty, retain any partial text returned for the parent crop.
+        return results or ([output.strip()] if output.strip() else [])
 
     chunks = split_table_image(image, max_height=TABLE_RECOGNITION_CHUNK_HEIGHT)
     responses: List[str] = []
@@ -377,11 +488,11 @@ async def _recognize_table_text_fallback(
         for line in lines
     )
     if not rows:
-        raise PipelineError(
-            f"Text fallback for table block {block.idx} returned no rows.",
-            status_code=502,
-            public_message="表格识别失败，文本补充识别没有返回内容。",
+        logger.warning(
+            "Table block %s produced no text after HTML and text OCR fallbacks; returning an empty table block.",
+            block.idx,
         )
+        return ""
     return "<table><tbody>" + rows + "</tbody></table>"
 
 
@@ -417,6 +528,9 @@ async def recognize_block(
             raw_out = await _recognize_table_text_fallback(
                 block, crop_img, sem, model_options,
             )
+            raw_out = await _retry_table_views(
+                block, crop_img, raw_out, sem, model_options,
+            )
             return postprocess_table(block, raw_out, element_formats.get("table", "html"))
 
     config = settings.oxr_model
@@ -426,6 +540,10 @@ async def recognize_block(
                 block, crop_img, sem, model_options,
                 preserve_image_tokens=bool(sources),
             )
+            if not sources:
+                raw_out = await _retry_table_views(
+                    block, crop_img, raw_out, sem, model_options,
+                )
         else:
             raw_out = await _request_with_retries(
                 lambda: _request_block(block, crop_img, sem, model_options),
@@ -441,6 +559,9 @@ async def recognize_block(
             mark_table_images(table_images)
         raw_out = await _recognize_table_text_fallback(
             block, crop_img, sem, model_options,
+        )
+        raw_out = await _retry_table_views(
+            block, crop_img, raw_out, sem, model_options,
         )
         return postprocess_table(block, raw_out, element_formats.get("table", "html"))
 
@@ -689,4 +810,40 @@ async def recognize_pages(
     for (page_idx, block_idx, _), block_result in zip(tasks, gathered_results):
         final_pages_blocks[page_idx][block_idx] = block_result
 
-    return [[block for block in page if block is not None] for page in final_pages_blocks]
+    recognized_pages = [
+        [block for block in page if block is not None]
+        for page in final_pages_blocks
+    ]
+
+    # Cross-check RECIST baseline dates against the nearby imaging reports.
+    # This runs after page OCR so it can use actual document context, then
+    # re-reads only suspicious table crops with the same model.
+    for page_idx, blocks in enumerate(recognized_pages):
+        nearby_pages = range(max(0, page_idx - 1), min(len(recognized_pages), page_idx + 2))
+        context_text = "\n".join(
+            block.content
+            for nearby_idx in nearby_pages
+            for block in recognized_pages[nearby_idx]
+            if block.type != BlockType.TABLE and block.content
+        )
+        for block in blocks:
+            if block.type != BlockType.TABLE or not block.content:
+                continue
+            issues = table_quality_issues(
+                block.content,
+                crop_image(pages_images[page_idx], block.bbox).shape[0],
+                context_text,
+            )
+            if "baseline_date_conflicts_with_adjacent_reports" not in issues:
+                continue
+            crop_img = crop_image(pages_images[page_idx], block.bbox)
+            corrected = await _retry_table_views(
+                block, crop_img, block.content, semaphore, model_options,
+                context_text=context_text,
+            )
+            if corrected != block.content:
+                block.content = postprocess_table(
+                    block, corrected, (element_formats or {}).get("table", "html"),
+                ).content
+
+    return recognized_pages
