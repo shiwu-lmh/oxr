@@ -33,7 +33,7 @@ from oxr.pipeline.table_segmentation import (
     split_table_image_with_bounds,
 )
 from oxr.pipeline.table_quality import table_quality_issues
-from oxr.utils.image import crop_image, resize_image
+from oxr.utils.image import crop_image, preprocess_text_image, resize_image
 from oxr.utils.table import _TableParser, strip_table_code_fence
 
 logger = logging.getLogger(__name__)
@@ -517,6 +517,19 @@ async def recognize_block(
         and element_formats.get("cs") == "image"
     ):
         return await asyncio.to_thread(postprocess_picture, block, crop_img, file_name, page_num)
+
+    if block.type in {
+        BlockType.TABLE,
+        BlockType.TEXT,
+        BlockType.TITLE,
+        BlockType.CAPTION,
+        BlockType.FOOTNOTE,
+        BlockType.PAGE_HEADER,
+        BlockType.PAGE_FOOTER,
+        BlockType.STAMP,
+        BlockType.CODE_BLOCK,
+    }:
+        crop_img = await asyncio.to_thread(preprocess_text_image, crop_img)
 
     sources: Dict[int, str] = {}
     if table_images:
