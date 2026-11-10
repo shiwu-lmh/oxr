@@ -247,6 +247,14 @@ DFINE_DEVICE=cuda \
 
 把项目中提供的`config.example.yaml`复制一份为`config.yaml`，将前面两个启动好的服务地址填写在`layout_analyze_model`和`oxr_model`的 url 参数中。
 
+`pipeline.verify_text_with_oxr` 可启用逐页文字复核：OXR 会结合整页图像复核识别出的文字区块。开启后每个含文字的页面会额外请求一次 OXR。`pipeline.text_verification_mode` 控制复核结果处理方式：`log`（默认）仅将差异候选写入服务日志并保留首轮 OCR；`apply` 会采用通过格式和区块 ID 校验的复核文本。启用复核并设置模式示例：
+
+```yaml
+pipeline:
+  verify_text_with_oxr: true
+  text_verification_mode: log  # 或 apply
+```
+
 ```Bash
 # pip install -c docker/requirements.allinone.txt .
 

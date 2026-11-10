@@ -255,6 +255,32 @@ class OXRModelClient:
             model_options=model_options,
         )
 
+    async def verify_page_text(
+        self,
+        image: np.ndarray,
+        recognized_blocks: list[dict[str, str]],
+        model_options: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Ask OXR to check page OCR candidates against the page image."""
+        import json
+
+        prompt = (
+            "Recheck each supplied OCR text block against the visible printed text "
+            "in this full-page image. Use nearby context only to distinguish glyphs "
+            "that are visibly present. Preserve all visible wording, names, numbers, "
+            "punctuation, and line breaks; do not infer or normalize. Return only a "
+            "JSON object mapping each supplied block id to its corrected transcription. "
+            "Include every id exactly once and do not add ids. Use [无法辨认] only "
+            "where the image itself is unreadable.\n\nOCR blocks:\n"
+            + json.dumps(recognized_blocks, ensure_ascii=False)
+        )
+        return await self._call_vision_model(
+            prompt=prompt,
+            image=image,
+            timeout=self.config.timeout,
+            model_options=model_options,
+        )
+
     async def recognize_chemical_structure(
         self,
         image: np.ndarray,

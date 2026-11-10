@@ -47,3 +47,8 @@ pipeline:
   # blue/white <tit> tokens. Incomplete IDs fall back to the original table image.
   table_image_placeholders: false
   table_image_min_score: 0.5
+  # Ask OXR to visually recheck recognized text blocks against each full page.
+  # Differences are logged as review candidates; see text_verification_mode below.
+  verify_text_with_oxr: true
+  # "log" keeps first-pass OCR; "apply" adopts valid OXR verification candidates.
+  text_verification_mode: log

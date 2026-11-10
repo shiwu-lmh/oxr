@@ -1,6 +1,7 @@
 import asyncio
 import cv2
 import html
+import json
 import logging
 import math
 import re
@@ -827,6 +828,80 @@ async def recognize_pages(
         [block for block in page if block is not None]
         for page in final_pages_blocks
     ]
+
+    if settings.pipeline.verify_text_with_oxr:
+        text_types = {
+            BlockType.TEXT, BlockType.TITLE, BlockType.CAPTION,
+            BlockType.FOOTNOTE, BlockType.PAGE_HEADER, BlockType.PAGE_FOOTER,
+            BlockType.STAMP,
+        }
+        async def verify_page(page_idx: int, blocks: List[Block]) -> None:
+            candidates = [
+                (local_idx, block)
+                for local_idx, block in enumerate(blocks)
+                if block.type in text_types and block.content
+            ]
+            if not candidates:
+                return
+            request_blocks = [
+                {"id": str(local_idx), "text": block.content}
+                for local_idx, block in candidates
+            ]
+            async with semaphore:
+                try:
+                    response = await _request_with_retries(
+                        lambda: model_client.verify_page_text(
+                            pages_images[page_idx], request_blocks, model_options,
+                        ),
+                        block=candidates[0][1],
+                        attempts=settings.oxr_model.retry_times,
+                        timeout=settings.oxr_model.timeout,
+                    )
+                except PipelineError:
+                    logger.warning(
+                        "OXR text verification failed for page %d; preserving original OCR.",
+                        page_idx + 1,
+                        exc_info=True,
+                    )
+                    return
+            try:
+                verified = json.loads(response)
+                if not isinstance(verified, dict):
+                    raise ValueError("verification response must be a JSON object")
+            except (TypeError, ValueError):
+                logger.warning(
+                    "OXR text verification returned invalid JSON for page %d; "
+                    "preserving original OCR: %r",
+                    page_idx + 1, response,
+                )
+                return
+            expected_ids = {str(local_idx) for local_idx, _ in candidates}
+            if set(verified) != expected_ids or any(
+                not isinstance(value, str) for value in verified.values()
+            ):
+                logger.warning(
+                    "OXR text verification returned mismatched block ids for page %d; "
+                    "preserving original OCR.",
+                    page_idx + 1,
+                )
+                return
+            for local_idx, block in candidates:
+                candidate = verified[str(local_idx)].strip()
+                if candidate != block.content:
+                    mode = settings.pipeline.text_verification_mode
+                    logger.warning(
+                        "OXR text verification %s page=%d block=%d "
+                        "original=%r candidate=%r.",
+                        "applied" if mode == "apply" else "candidate",
+                        page_idx + 1, local_idx, block.content, candidate,
+                    )
+                    if mode == "apply":
+                        block.content = candidate
+
+        await asyncio.gather(*(
+            verify_page(page_idx, blocks)
+            for page_idx, blocks in enumerate(recognized_pages)
+        ))
 
     # Cross-check RECIST baseline dates against the nearby imaging reports.
     # This runs after page OCR so it can use actual document context, then
