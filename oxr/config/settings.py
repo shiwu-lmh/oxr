@@ -62,6 +62,7 @@ class PipelineConfig(BaseModel):
     model_config = ConfigDict(validate_assignment=True, extra="forbid")
 
     image_output_dir: str = "outputs"
+    text_dedupe: bool = False
     full_overlap_dedupe: bool = False
     table_image_placeholders: bool = False
     table_image_min_score: float = Field(default=0.5, ge=0.0, le=1.0)

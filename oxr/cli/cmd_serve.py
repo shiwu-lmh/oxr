@@ -35,6 +35,11 @@ def _reject_legacy_options(options: dict[str, object]) -> None:
 
 def serve(
     config: Optional[str] = typer.Option(None, "--config", help="Path to config.yaml"),
+    text_dedupe: Optional[bool] = typer.Option(
+        None,
+        "--text-dedupe/--no-text-dedupe",
+        help="Enable text duplicate cleanup; disabled by default.",
+    ),
     full_overlap_dedupe: Optional[bool] = typer.Option(
         None,
         "--full-overlap-dedupe/--no-full-overlap-dedupe",
@@ -114,6 +119,8 @@ def serve(
 
     if host is not None:
         settings.server.host = host
+    if text_dedupe is not None:
+        settings.pipeline.text_dedupe = text_dedupe
     if full_overlap_dedupe is not None:
         settings.pipeline.full_overlap_dedupe = full_overlap_dedupe
     if table_image_placeholders is not None:
@@ -161,6 +168,9 @@ def serve(
     settings.validate_for_server()
 
     os.environ["OXR__SERVER__HOST"] = str(settings.server.host)
+    os.environ["OXR__PIPELINE__TEXT_DEDUPE"] = str(
+        settings.pipeline.text_dedupe
+    ).lower()
     os.environ["OXR__PIPELINE__FULL_OVERLAP_DEDUPE"] = str(
         settings.pipeline.full_overlap_dedupe
     ).lower()

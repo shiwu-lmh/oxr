@@ -39,6 +39,8 @@ oxr_model:
 pipeline:
   # Directory used to save extracted image outputs.
   image_output_dir: outputs
+  # Text cleanup is opt-in; default false preserves repeated text as recognized.
+  text_dedupe: false
   # Opt in to all-category cleanup: outer boxes absorb contained boxes first;
   # any remaining positive-area overlap keeps the higher LA confidence.
   # Equal confidence keeps the earlier block; missing confidence skips comparison.

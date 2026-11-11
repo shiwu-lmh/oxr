@@ -9,6 +9,7 @@ from oxr.pipeline.table_segmentation import (
     extract_table_header_schema,
     table_row_widths,
 )
+from oxr.pipeline.postprocess.exact_text_dedupe import dedupe_repeated_text_regions
 
 
 logger = logging.getLogger(__name__)
@@ -35,8 +36,16 @@ def _continues_paragraph(previous: Block, following: Block) -> bool:
     return previous.type == following.type == BlockType.TEXT
 
 
-def stitch_markdown_pages(pages: list[list[Block]]) -> list[list[Block]]:
-    """Merge only high-confidence page-edge continuations in a copy of blocks."""
+def stitch_markdown_pages(
+    pages: list[list[Block]], page_heights: list[int] | None = None,
+    *, dedupe_text: bool = False,
+) -> list[list[Block]]:
+    """Clean exact text repeats and stitch continuations in copied page blocks.
+
+    Text deduplication is limited to blocks whose boxes reach the bottom and
+    top bands of adjacent pages. Table continuation remains on its existing
+    schema and row-width path.
+    """
     result = [[Block(**vars(block)) for block in page] for page in pages]
     for page_index in range(1, len(result)):
         previous_page, current_page = result[page_index - 1], result[page_index]
@@ -58,6 +67,48 @@ def stitch_markdown_pages(pages: list[list[Block]]) -> list[list[Block]]:
                 current_page.remove(following)
                 logger.info("Stitched matching table continuation across pages %d and %d.", page_index, page_index + 1)
                 continue
+
+        if dedupe_text and page_heights and len(page_heights) == len(result):
+            previous_height = page_heights[page_index - 1]
+            current_height = page_heights[page_index]
+            has_bottom_anchor = any(
+                block.type == BlockType.TEXT
+                and block.bbox[3] >= 0.85 * previous_height
+                for block in previous_page
+            )
+            has_top_anchor = any(
+                block.type == BlockType.TEXT
+                and block.bbox[1] <= 0.15 * current_height
+                for block in current_page
+            )
+            if previous_height > 0 and current_height > 0 and has_bottom_anchor and has_top_anchor:
+                previous_edge = [
+                    block for block in previous_page
+                    if block.type == BlockType.TEXT
+                    and block.bbox[3] >= 0.4 * previous_height
+                ]
+                current_edge = [
+                    block for block in current_page
+                    if block.type == BlockType.TEXT
+                    and block.bbox[1] <= 0.2 * current_height
+                ]
+                for following in current_edge:
+                    updated = following.content
+                    for previous in previous_edge:
+                        updated = dedupe_repeated_text_regions(previous.content, updated)
+                        if not updated:
+                            break
+                    if updated != following.content:
+                        following.content = updated
+                        if not updated.strip():
+                            current_page.remove(following)
+                        logger.info(
+                            "Removed exact repeated text at page boundary %d/%d.",
+                            page_index, page_index + 1,
+                        )
+
+        if following not in current_page:
+            continue
 
         if _continues_paragraph(previous, following):
             previous.content = previous.content.rstrip() + " " + following.content.lstrip()

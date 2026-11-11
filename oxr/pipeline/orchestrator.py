@@ -31,7 +31,10 @@ from oxr.pipeline.postprocess.overlap_dedupe import (
     dedupe_visual_parents,
     dedupe_complete_text,
 )
-from oxr.pipeline.postprocess.exact_text_dedupe import dedupe_exact_textual_blocks
+from oxr.pipeline.postprocess.exact_text_dedupe import (
+    dedupe_contained_text_blocks,
+    dedupe_exact_textual_blocks,
+)
 from oxr.pipeline.postprocess.full_overlap_dedupe import dedupe_full_overlaps
 from oxr.pipeline.postprocess.table_images import TABLE_IMAGE_ROLE
 from oxr.pipeline.postprocess.heading_hierarchy import assign_heading_levels
@@ -159,6 +162,7 @@ async def _process_decoded_document(
     full_overlap_dedupe = settings.pipeline.full_overlap_dedupe
     ext = os.path.splitext(file_name)[1].lower()
     page_num = len(images)
+    text_dedupe = settings.pipeline.text_dedupe
     decode_end_time = time.perf_counter()
 
     # 2. Phase 1: Layout Analysis
@@ -287,7 +291,7 @@ async def _process_decoded_document(
         for blocks in pages_blocks
     ]
 
-    if _SYSTEMATIC_CROSS_CATEGORY_DEDUPE and not full_overlap_dedupe:
+    if _SYSTEMATIC_CROSS_CATEGORY_DEDUPE and text_dedupe and not full_overlap_dedupe:
         pages_blocks = [
             dedupe_systematic_cross_category_blocks(blocks)
             for blocks in pages_blocks
@@ -308,14 +312,24 @@ async def _process_decoded_document(
                 dedupe_visual_parents(raw, blocks, image)
                 for raw, blocks, image in zip(raw_pages_blocks, pages_blocks, images)
             ]
-        if _COMPLETE_TEXT_DEDUPE:
-            pages_blocks = [dedupe_complete_text(blocks) for blocks in pages_blocks]
-        pages_blocks = [dedupe_exact_textual_blocks(blocks) for blocks in pages_blocks]
+        if text_dedupe:
+            if _COMPLETE_TEXT_DEDUPE:
+                pages_blocks = [dedupe_complete_text(blocks) for blocks in pages_blocks]
+            pages_blocks = [dedupe_contained_text_blocks(blocks) for blocks in pages_blocks]
+            pages_blocks = [dedupe_exact_textual_blocks(blocks) for blocks in pages_blocks]
 
     assign_heading_levels(pages_blocks)
-    stitched_pages = stitch_markdown_pages(pages_blocks)
+    stitched_pages = stitch_markdown_pages(
+        pages_blocks,
+        page_heights=[image.shape[0] for image in images],
+        dedupe_text=text_dedupe,
+    )
     merged_from_previous = [
         len(stitched) < len(original)
+        or any(
+            merged.content != source.content
+            for merged, source in zip(stitched, original)
+        )
         for original, stitched in zip(pages_blocks, stitched_pages)
     ]
 

@@ -248,6 +248,19 @@ DFINE_DEVICE=cuda \
 
 Copy the provided `config.example.yaml` to `config.yaml`. Set the url fields under `layout_analyze_model` and `oxr_model` to the addresses of the two services you started above.
 
+Text deduplication is disabled by default. To enable it, set `pipeline.text_dedupe: true` in `config.yaml`, or pass `--text-dedupe` when starting the server:
+
+```yaml
+pipeline:
+  text_dedupe: true
+```
+
+```bash
+oxr serve --config config.yaml --text-dedupe
+```
+
+The command-line option overrides the config file. Use `--no-text-dedupe` to force it off. Restart the OXR server after changing the config.
+
 ```Bash
 # pip install -c docker/requirements.allinone.txt .
 
