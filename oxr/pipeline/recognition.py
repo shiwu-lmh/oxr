@@ -34,6 +34,10 @@ from oxr.pipeline.table_segmentation import (
     split_table_image_with_bounds,
 )
 from oxr.pipeline.table_quality import table_quality_issues
+from oxr.pipeline.table_grid import (
+    GridCell, TableGrid, detect_table_grid, make_cell_batches, parse_indexed_cells,
+    render_table_grid,
+)
 from oxr.utils.image import crop_image, preprocess_text_image, resize_image
 from oxr.utils.table import _TableParser, strip_table_code_fence
 
@@ -42,6 +46,253 @@ logger = logging.getLogger(__name__)
 LENGTH_RECOVERY_REPETITION_PENALTY = 1.1
 TABLE_LENGTH_RECOVERY_SCALE = 0.75
 ZERO_OUTPUT_MIN_TOKENS = 128
+TABLE_GRID_CROP_MARGIN = 32
+
+
+def _find_blood_pressure_column(grid, values: dict[int, str]) -> Optional[int]:
+    """Find BP from a readable label or the known vital-sign header sequence."""
+    labels = {
+        grid.cells[index - 1].column: html.unescape(value)
+        for index, value in values.items()
+        if grid.cells[index - 1].row < grid.header_rows
+    }
+    for column, label in labels.items():
+        if re.search(r"\bBP\b|血压", label, re.I):
+            return column
+
+    # In common nursing observation tables the grouped vital-sign header is
+    # T, P, R, BP, SpO2. If OCR drops only the BP label, recover its position
+    # from the neighboring visible labels and the physical merged header.
+    for parent in grid.cells:
+        if parent.row != 0 or parent.colspan < 4:
+            continue
+        start, end = parent.column, parent.column + parent.colspan
+        children = [
+            cell for cell in grid.cells
+            if cell.row == 1 and start <= cell.column < end
+        ]
+        child_labels = {
+            cell.column: labels.get(cell.column, "")
+            for cell in children
+        }
+        t_columns = [c for c, label in child_labels.items() if re.search(r"(?:^|[^A-Z])T(?:[^A-Z]|$)|体温", label, re.I)]
+        p_columns = [c for c, label in child_labels.items() if re.search(r"(?:^|[^A-Z])P(?:[^A-Z]|$)|脉搏", label, re.I)]
+        r_columns = [c for c, label in child_labels.items() if re.search(r"(?:^|[^A-Z])R(?:[^A-Z]|$)|呼吸", label, re.I)]
+        spo2_columns = [c for c, label in child_labels.items() if re.search(r"SP\s*%|SpO.?2|血氧", label, re.I)]
+        if all(len(columns) == 1 for columns in (t_columns, p_columns, r_columns, spo2_columns)):
+            t_col, p_col, r_col, spo2_col = (
+                t_columns[0], p_columns[0], r_columns[0], spo2_columns[0],
+            )
+            if (
+                t_col + 1 == p_col
+                and p_col + 1 == r_col
+                and r_col + 2 == spo2_col
+            ):
+                return r_col + 1
+    return None
+
+
+def _join_wrapped_blood_pressure(value: str) -> str:
+    """Join whitespace introduced between vertically wrapped BP characters."""
+    value = value.strip()
+    return re.sub(r"(?<=\d)\s+(?=[\d/])|(?<=/)\s+(?=\d)", "", value)
+
+
+def _split_sequential_index_spans(
+    grid: TableGrid,
+    values: dict[int, str],
+) -> tuple[TableGrid, dict[int, str]]:
+    """Undo a false rowspan when sequential row numbers were OCRed together."""
+    serial_header = next((
+        index for index, cell in enumerate(grid.cells, 1)
+        if cell.row == 0 and cell.column == 0
+        and values[index].strip() == "序号"
+    ), None)
+    if serial_header is None:
+        return grid, values
+
+    items: list[tuple[GridCell, str]] = []
+    for index, cell in enumerate(grid.cells, 1):
+        content = values[index].strip()
+        numbers = re.findall(r"\d+", content)
+        can_split = (
+            cell.row >= grid.header_rows
+            and cell.column == 0
+            and cell.rowspan > 1
+            and len(numbers) == cell.rowspan
+            and re.fullmatch(r"\d+(?:\s+\d+)+", content) is not None
+            and all(int(right) == int(left) + 1 for left, right in zip(numbers, numbers[1:]))
+        )
+        if not can_split:
+            items.append((cell, values[index]))
+            continue
+
+        x1, _, x2, _ = cell.box
+        row_boxes = []
+        for row in range(cell.row, cell.row + cell.rowspan):
+            neighbors = [
+                other for other in grid.cells
+                if other.row == row and other.column != cell.column and other.rowspan == 1
+            ]
+            if not neighbors:
+                row_boxes = []
+                break
+            top = min(other.box[1] for other in neighbors)
+            bottom = min(other.box[3] for other in neighbors)
+            row_boxes.append((top, bottom))
+        if len(row_boxes) != cell.rowspan:
+            items.append((cell, values[index]))
+            continue
+        items.extend((
+            GridCell(cell.row + offset, cell.column, 1, 1, (x1, top, x2, bottom)),
+            number,
+        ) for offset, (number, (top, bottom)) in enumerate(zip(numbers, row_boxes)))
+
+    items.sort(key=lambda item: (item[0].row, item[0].column))
+    new_grid = TableGrid(
+        grid.rows, grid.columns, grid.header_rows,
+        tuple(cell for cell, _ in items),
+    )
+    return new_grid, {
+        index: value for index, (_, value) in enumerate(items, 1)
+    }
+
+
+async def _recognize_ruled_table(
+    block: Block,
+    image: np.ndarray,
+    sem: asyncio.Semaphore,
+    model_options: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    """Transcribe a confidently detected ruled grid by physical cell position."""
+    grid = detect_table_grid(image)
+    if grid is None:
+        return None
+
+    all_ids = tuple(range(1, len(grid.cells) + 1))
+    config = settings.oxr_model
+    bp_ids: set[int] = set()
+
+    async def recognize_batch(
+        batch_image: np.ndarray, batch_ids: tuple[int, ...],
+    ) -> str:
+        blood_pressure_ids = tuple(
+            index for index in batch_ids if index in bp_ids
+        )
+        async with sem:
+            return await _request_with_retries(
+                lambda: model_client.recognize_table_cells(
+                    batch_image, model_options,
+                    blood_pressure_ids=blood_pressure_ids,
+                ),
+                block=block,
+                attempts=config.retry_times,
+                timeout=config.timeout,
+            )
+
+    values: dict[int, str] = {}
+    header_ids = tuple(
+        index for index, cell in enumerate(grid.cells, 1)
+        if cell.row < grid.header_rows
+    )
+    header_batches = list(make_cell_batches(
+        image, grid, header_ids, enlarge_ids=header_ids,
+    ))
+    header_responses = await asyncio.gather(*(
+        recognize_batch(batch_image, batch_ids)
+        for batch_ids, batch_image in header_batches
+    ))
+    for (batch_ids, _), response in zip(header_batches, header_responses):
+        values.update(parse_indexed_cells(response, batch_ids))
+    # Use the transcribed header to identify BP by its actual grid column.
+    bp_column = _find_blood_pressure_column(grid, values)
+    bp_ids = {
+        index for index, cell in enumerate(grid.cells, 1)
+        if bp_column is not None
+        and cell.row >= grid.header_rows
+        and cell.column == bp_column
+    }
+    body_ids = tuple(
+        index for index in all_ids
+        if index not in values and index not in header_ids
+    )
+    ordinary_ids = tuple(index for index in body_ids if index not in bp_ids)
+    batches = list(make_cell_batches(image, grid, ordinary_ids))
+    batches.extend(make_cell_batches(
+        image, grid, tuple(index for index in body_ids if index in bp_ids),
+        enlarge_ids=tuple(index for index in body_ids if index in bp_ids),
+    ))
+    if not batches and not header_batches:
+        return None
+
+    responses = await asyncio.gather(*(
+        recognize_batch(batch_image, batch_ids)
+        for batch_ids, batch_image in batches
+    ))
+    for (batch_ids, _), response in zip(batches, responses):
+        parsed = parse_indexed_cells(response, batch_ids)
+        if values.keys() & parsed.keys():
+            raise ValueError("Ruled table returned duplicate cell IDs across batches.")
+        values.update(parsed)
+
+    # A missing ID is an unread cell, not permission to shift later values.
+    # Re-read only those crops, with two bounded attempts to recover them.
+    for _ in range(2):
+        missing = tuple(index for index in all_ids if index not in values)
+        if not missing:
+            break
+        logger.warning(
+            "Ruled table block %s omitted %d cell IDs; retrying only those cells.",
+            block.idx, len(missing),
+        )
+        missing_header = tuple(index for index in missing if index in header_ids)
+        missing_body = tuple(index for index in missing if index not in header_ids)
+        retry_batches = list(make_cell_batches(
+            image, grid, tuple(index for index in missing_body if index not in bp_ids),
+        ))
+        retry_batches.extend(make_cell_batches(
+            image, grid, tuple(index for index in missing_body if index in bp_ids),
+            enlarge_ids=tuple(index for index in missing_body if index in bp_ids),
+        ))
+        retry_batches.extend(make_cell_batches(
+            image, grid, missing_header, enlarge_ids=missing_header,
+        ))
+        retry_responses = await asyncio.gather(*(
+            recognize_batch(batch_image, batch_ids)
+            for batch_ids, batch_image in retry_batches
+        ))
+        for (batch_ids, _), response in zip(retry_batches, retry_responses):
+            parsed = parse_indexed_cells(response, batch_ids)
+            if values.keys() & parsed.keys():
+                raise ValueError("Ruled table retry returned an unexpected cell ID.")
+            values.update(parsed)
+
+    missing = tuple(index for index in all_ids if index not in values)
+    if 0 < len(missing) <= 32:
+        logger.warning(
+            "Ruled table block %s still lacks %d cell IDs; retrying them individually.",
+            block.idx, len(missing),
+        )
+        single_batches = [
+            next(make_cell_batches(image, grid, (index,), enlarge_ids=(index,)))
+            for index in missing
+        ]
+        single_responses = await asyncio.gather(*(
+            recognize_batch(batch_image, batch_ids)
+            for batch_ids, batch_image in single_batches
+        ))
+        for (batch_ids, _), response in zip(single_batches, single_responses):
+            parsed = parse_indexed_cells(response, batch_ids)
+            if values.keys() & parsed.keys():
+                raise ValueError("Ruled table single-cell retry returned a duplicate ID.")
+            values.update(parsed)
+
+    if values.keys() != set(all_ids):
+        raise ValueError("Ruled table cell transcription is incomplete.")
+    for index in bp_ids:
+        values[index] = _join_wrapped_blood_pressure(values[index])
+    grid, values = _split_sequential_index_spans(grid, values)
+    return render_table_grid(grid, values)
 
 
 def _is_zero_only_output(text: str) -> bool:
@@ -508,6 +759,16 @@ async def recognize_block(
     table_images: Optional[List[Block]] = None,
 ) -> Block:
     crop_img = crop_image(page_image, block.bbox)
+    grid_crop_img = None
+    if block.type == BlockType.TABLE:
+        page_h, page_w = page_image.shape[:2]
+        x1, y1, x2, y2 = block.bbox
+        grid_crop_img = crop_image(page_image, [
+            max(0, x1 - TABLE_GRID_CROP_MARGIN),
+            max(0, y1 - TABLE_GRID_CROP_MARGIN),
+            min(page_w, x2 + TABLE_GRID_CROP_MARGIN),
+            min(page_h, y2 + TABLE_GRID_CROP_MARGIN),
+        ])
     element_formats = element_formats or {}
 
     if block.type == BlockType.PICTURE:
@@ -550,13 +811,33 @@ async def recognize_block(
     config = settings.oxr_model
     try:
         if block.type == BlockType.TABLE:
-            raw_out = await _recognize_table_image(
-                block, crop_img, sem, model_options,
-                preserve_image_tokens=bool(sources),
-            )
             if not sources:
-                raw_out = await _retry_table_views(
-                    block, crop_img, raw_out, sem, model_options,
+                assert grid_crop_img is not None
+                try:
+                    raw_out = await _recognize_ruled_table(
+                        block, grid_crop_img, sem, model_options,
+                    )
+                except (PipelineError, ValueError) as error:
+                    logger.warning(
+                        "Ruled-grid OCR failed for table %s (%s); falling back to full-table OCR.",
+                        block.idx, type(error).__name__,
+                    )
+                    raw_out = None
+                if raw_out is None:
+                    logger.info(
+                        "Table block %s has no usable ruled grid; using full-table OCR.",
+                        block.idx,
+                    )
+                    raw_out = await _recognize_table_image(
+                        block, crop_img, sem, model_options,
+                    )
+                    raw_out = await _retry_table_views(
+                        block, crop_img, raw_out, sem, model_options,
+                    )
+            else:
+                raw_out = await _recognize_table_image(
+                    block, crop_img, sem, model_options,
+                    preserve_image_tokens=True,
                 )
         else:
             raw_out = await _request_with_retries(

@@ -222,6 +222,32 @@ class OXRModelClient:
             model_options=model_options,
         )
 
+    async def recognize_table_cells(
+        self,
+        image: np.ndarray,
+        model_options: Optional[Dict[str, Any]] = None,
+        *,
+        blood_pressure_ids: tuple[int, ...] = (),
+    ) -> str:
+        """Transcribe isolated, numbered cells without relying on row layout."""
+        from oxr.model.prompts import PROMPT_TABLE_CELL_RECOGNITION
+        prompt = PROMPT_TABLE_CELL_RECOGNITION
+        if blood_pressure_ids:
+            labels = ", ".join(f"K{index:04}" for index in blood_pressure_ids)
+            prompt += (
+                f" The following IDs are blood-pressure cells: {labels}. Their narrow printed values "
+                "may wrap onto multiple visual lines. Read top to bottom and join the visible "
+                "characters without inserting punctuation at line breaks. For example, visible "
+                "lines `10`, `4/`, `66` transcribe as `104/66`: only the slash visibly printed "
+                "after 4 is a separator. Do not add or remove any visible digit or slash."
+            )
+        return await self._call_vision_model(
+            prompt=prompt,
+            image=image,
+            timeout=self.config.timeout,
+            model_options=model_options,
+        )
+
 
     async def recognize_code(self, image: np.ndarray, model_options: Optional[Dict[str, Any]] = None) -> str:
         from oxr.model.prompts import PROMPT_CODE_RECOGNITION
