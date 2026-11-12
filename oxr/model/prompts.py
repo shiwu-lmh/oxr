@@ -5,7 +5,7 @@ from numbers import Real
 
 _WATERMARK_GUIDANCE = """Ignore decorative watermarks and translucent background marks when transcribing. Preserve meaningful stamps and printed document text. Never guess characters fully covered by a watermark; leave unclear text unfilled."""
 
-PROMPT_TEXT_RECOGNITION = f"""Transcribe the visible text character by character in reading order. Preserve the source wording, original characters, punctuation, line breaks, numbering, names, dates, and numbers. Before answering, visually recheck ambiguous glyphs against the image and use nearby context only to distinguish characters that are visibly present. Do not correct grammar, normalize wording, infer missing content, or silently replace uncertain characters. Mark unreadable text as [无法辨认]. Output only the transcription. {_WATERMARK_GUIDANCE}"""
+PROMPT_TEXT_RECOGNITION = f"""Transcribe the visible text character by character in reading order. Preserve the source wording, original characters, punctuation, line breaks, numbering, names, dates, and numbers. Before answering, visually recheck ambiguous glyphs against the image and use nearby context only to distinguish characters that are visibly present. Do not correct grammar, normalize wording, infer missing content, or silently replace uncertain characters. Never continue or extrapolate a numeric sequence or list; include a number only when its glyph is visibly present in the image. Mark unreadable text as [无法辨认]. Output only the transcription. {_WATERMARK_GUIDANCE}"""
 
 PROMPT_FORMULA_RECOGNITION = f"""Recognize the formula of the image into KaTex format. {_WATERMARK_GUIDANCE}"""
 
