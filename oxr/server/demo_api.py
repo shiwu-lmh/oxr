@@ -9,7 +9,7 @@ import time
 
 import cv2
 from fastapi import APIRouter, File, Form, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from oxr.pipeline import orchestrator
 from oxr.pipeline.errors import get_public_error_message
@@ -28,6 +28,231 @@ def _error(message: str, status: int) -> JSONResponse:
 
 def _response(data: dict) -> dict:
     return {"code": 0, "message": "success", "data": data}
+
+
+
+class _TableRowsParser:
+    def __init__(self):
+        from html.parser import HTMLParser
+
+        class Parser(HTMLParser):
+            def __init__(self, outer):
+                super().__init__(convert_charrefs=True)
+                self.outer = outer
+                self.in_cell = False
+
+            def handle_starttag(self, tag, attrs):
+                if tag == "tr":
+                    self.outer.current_row = []
+                elif tag in {"td", "th"}:
+                    self.in_cell = True
+                    self.outer.current_cell = ""
+
+            def handle_data(self, data):
+                if self.in_cell:
+                    self.outer.current_cell += data
+
+            def handle_endtag(self, tag):
+                if tag in {"td", "th"} and self.in_cell:
+                    self.outer.current_row.append(" ".join(self.outer.current_cell.split()))
+                    self.in_cell = False
+                elif tag == "tr" and self.outer.current_row:
+                    self.outer.rows.append(self.outer.current_row)
+                    self.outer.current_row = []
+
+        self.rows = []
+        self.current_row = []
+        self.current_cell = ""
+        self.parser = Parser(self)
+
+    def feed(self, text):
+        self.parser.feed(text)
+
+
+def _markdown_docx(markdown: str, title: str):
+    from io import BytesIO
+    from html import unescape
+    from html.parser import HTMLParser
+    import re
+    from docx import Document
+    from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Inches, Pt, RGBColor
+
+    class PlainTextParser(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.parts = []
+
+        def handle_data(self, data):
+            self.parts.append(data)
+
+    def plain(text):
+        parser = PlainTextParser()
+        parser.feed(text)
+        return " ".join("".join(parser.parts).split())
+
+    def inline(text):
+        text = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", text)
+        text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1（\2）", text)
+        text = plain(text)
+        for marker in ("**", "__", "~~", chr(96), "*"):
+            text = text.replace(marker, "")
+        return unescape(text).strip()
+
+    def markdown_row(line):
+        return [inline(cell.replace(r"\|", "|")) for cell in line.strip().strip("|").split("|")]
+
+    def add_table(rows):
+        if not rows:
+            return
+        width = max(len(row) for row in rows)
+        table = document.add_table(rows=0, cols=width)
+        table.style = "Table Grid"
+        table.autofit = True
+        for row_index, row in enumerate(rows):
+            cells = table.add_row().cells
+            for column, value in enumerate(row + [""] * (width - len(row))):
+                cells[column].vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+                cells[column].text = value
+                for paragraph in cells[column].paragraphs:
+                    for run in paragraph.runs:
+                        run.font.size = Pt(9)
+                        if row_index == 0:
+                            run.bold = True
+        document.add_paragraph()
+
+    document = Document()
+    section = document.sections[0]
+    section.top_margin = Inches(0.7)
+    section.bottom_margin = Inches(0.7)
+    section.left_margin = Inches(0.75)
+    section.right_margin = Inches(0.75)
+    normal = document.styles["Normal"]
+    normal.font.name = "宋体"
+    normal.font.size = Pt(10.5)
+    normal._element.rPr.rFonts.set(
+        "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}eastAsia", "宋体"
+    )
+    for style_name, size in (("Title", 18), ("Heading 1", 16), ("Heading 2", 14), ("Heading 3", 12)):
+        style = document.styles[style_name]
+        style.font.name = "黑体"
+        style.font.size = Pt(size)
+        style.font.color.rgb = RGBColor(31, 78, 121)
+        style._element.rPr.rFonts.set(
+            "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}eastAsia", "黑体"
+        )
+    if title:
+        heading = document.add_paragraph(style="Title")
+        heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        heading.add_run(title)
+
+    lines = markdown.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    index = 0
+    in_code = False
+    code_lines = []
+    while index < len(lines):
+        stripped = lines[index].strip()
+        if stripped.startswith(chr(96) * 3):
+            if in_code:
+                paragraph = document.add_paragraph()
+                run = paragraph.add_run("\n".join(code_lines))
+                run.font.name = "Consolas"
+                run.font.size = Pt(9)
+                code_lines = []
+                in_code = False
+            else:
+                in_code = True
+            index += 1
+            continue
+        if in_code:
+            code_lines.append(lines[index])
+            index += 1
+            continue
+        if not stripped:
+            index += 1
+            continue
+        if "<table" in stripped.lower():
+            html_table = [stripped]
+            while "</table>" not in html_table[-1].lower() and index + 1 < len(lines):
+                index += 1
+                html_table.append(lines[index].strip())
+                if not lines[index].strip() and "</table>" not in "".join(html_table).lower():
+                    break
+            parser = _TableRowsParser()
+            parser.feed("\n".join(html_table))
+            add_table([[inline(cell) for cell in row] for row in parser.rows])
+            index += 1
+            continue
+        if stripped.startswith("|") and "|" in stripped[1:]:
+            rows = []
+            while index < len(lines) and lines[index].strip().startswith("|"):
+                row = markdown_row(lines[index])
+                if row and not all(re.fullmatch(r":?-{3,}:?", cell.replace(" ", "")) for cell in row):
+                    rows.append(row)
+                index += 1
+            add_table(rows)
+            continue
+        heading = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+        if heading:
+            document.add_paragraph(
+                inline(heading.group(2)), style=f"Heading {min(len(heading.group(1)), 3)}"
+            )
+        elif re.match(r"^[-*+]\s+", stripped):
+            document.add_paragraph(
+                inline(re.sub(r"^[-*+]\s+", "", stripped)), style="List Bullet"
+            )
+        elif re.match(r"^\d+[.)]\s+", stripped):
+            document.add_paragraph(
+                inline(re.sub(r"^\d+[.)]\s+", "", stripped)), style="List Number"
+            )
+        elif stripped.startswith(">"):
+            quote = document.add_paragraph(style="Quote")
+            quote.add_run(inline(stripped.lstrip("> ")))
+        elif stripped not in {"---", "***", "___"}:
+            document.add_paragraph(inline(stripped))
+        index += 1
+    if in_code and code_lines:
+        paragraph = document.add_paragraph()
+        run = paragraph.add_run("\n".join(code_lines))
+        run.font.name = "Consolas"
+        run.font.size = Pt(9)
+    output = BytesIO()
+    document.save(output)
+    output.seek(0)
+    return output
+
+
+@router.post("/export/docx")
+async def export_markdown_docx(request: Request):
+    try:
+        payload = await request.json()
+    except (ValueError, TypeError):
+        return _error("Word 导出请求格式无效。", 400)
+    if not isinstance(payload, dict):
+        return _error("Word 导出请求格式无效。", 400)
+    markdown = payload.get("markdown")
+    file_name = payload.get("file_name", "document")
+    if not isinstance(markdown, str) or not markdown.strip():
+        return _error("没有可导出的 Markdown 内容。", 422)
+    if len(markdown.encode("utf-8")) > 20 * 1024 * 1024:
+        return _error("识别结果过大，无法导出 Word。", 413)
+    safe_name = Path(str(file_name).replace("\\", "/")).name
+    stem = Path(safe_name).stem or "document"
+    try:
+        output = await asyncio.to_thread(_markdown_docx, markdown, stem)
+    except ImportError:
+        LOGGER.exception("python-docx is unavailable")
+        return _error("Word 导出依赖未安装，请安装项目依赖后重启服务。", 503)
+    except Exception as exc:
+        LOGGER.warning("Word export failed (error_type=%s)", type(exc).__name__)
+        return _error("Word 文档生成失败。", 500)
+    from urllib.parse import quote
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(stem + '-OXR.docx')}"},
+    )
 
 
 def _decode_and_publish(store: DemoStore, job_id: str, data: bytes, file_name: str):

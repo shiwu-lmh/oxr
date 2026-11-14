@@ -17,6 +17,7 @@ dependencies = [
     "pydantic-settings",
     "PyYAML",
     "httpx",
+    "python-docx>=1.1.2",
 ]
 
 [project.scripts]

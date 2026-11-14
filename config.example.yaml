@@ -39,6 +39,8 @@ oxr_model:
 pipeline:
   # Directory used to save extracted image outputs.
   image_output_dir: outputs
+  # Text cleanup is opt-in; default false preserves repeated text as recognized.
+  text_dedupe: false
   # Opt in to all-category cleanup: outer boxes absorb contained boxes first;
   # any remaining positive-area overlap keeps the higher LA confidence.
   # Equal confidence keeps the earlier block; missing confidence skips comparison.
@@ -47,3 +49,8 @@ pipeline:
   # blue/white <tit> tokens. Incomplete IDs fall back to the original table image.
   table_image_placeholders: false
   table_image_min_score: 0.5
+  # Ask OXR to visually recheck recognized text blocks against each full page.
+  # Differences are logged as review candidates; see text_verification_mode below.
+  verify_text_with_oxr: true
+  # "log" keeps first-pass OCR; "apply" adopts valid OXR verification candidates.
+  text_verification_mode: log

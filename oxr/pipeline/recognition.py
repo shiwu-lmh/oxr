@@ -1,5 +1,10 @@
 import asyncio
+import cv2
+import html
+import json
 import logging
+import math
+import re
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import numpy as np
@@ -8,26 +13,302 @@ from oxr.config.settings import settings
 from oxr.model.client import model_client
 from oxr.pipeline.concurrency import gather_cancel_on_error
 from oxr.pipeline.errors import PipelineError, format_error_message, get_error_status_code
-from oxr.pipeline.models import Block, BlockType
+from oxr.pipeline.models import Block, BlockType, ContentFormat
 from oxr.pipeline.postprocess.chemical_structure_postprocess import (
     postprocess_chemical_structure,
 )
 from oxr.pipeline.postprocess.code_postprocess import postprocess_code
 from oxr.pipeline.postprocess.formula_postprocess import postprocess_formula
 from oxr.pipeline.postprocess.picture_postprocess import postprocess_picture
-from oxr.pipeline.postprocess.repetition_postprocess import postprocess_repetition_loops
 from oxr.pipeline.postprocess.table_postprocess import postprocess_table
 from oxr.pipeline.postprocess.table_images import (
     group_table_images, mark_table_images, prepare_table_images,
-    restore_table_images, table_image_fallback, unchanged_block,
+    restore_table_images, unchanged_block,
 )
 from oxr.pipeline.postprocess.text_postprocess import postprocess_text
-from oxr.utils.image import crop_image, resize_image
+from oxr.pipeline.table_segmentation import (
+    combine_table_chunks,
+    expected_table_columns, extract_table_header_schema,
+    is_balanced_table_html, is_complete_table_html,
+    repair_table_html_prefix, split_table_image, table_row_widths,
+    split_table_image_with_bounds,
+)
+from oxr.pipeline.table_quality import table_quality_issues
+from oxr.pipeline.table_grid import (
+    GridCell, TableGrid, detect_table_grid, make_cell_batches, parse_indexed_cells,
+    render_table_grid,
+)
+from oxr.utils.image import crop_image, preprocess_text_image, resize_image
+from oxr.utils.table import _TableParser, strip_table_code_fence
 
 logger = logging.getLogger(__name__)
 
 LENGTH_RECOVERY_REPETITION_PENALTY = 1.1
 TABLE_LENGTH_RECOVERY_SCALE = 0.75
+ZERO_OUTPUT_MIN_TOKENS = 128
+TABLE_GRID_CROP_MARGIN = 32
+
+
+def _find_blood_pressure_column(grid, values: dict[int, str]) -> Optional[int]:
+    """Find BP from a readable label or the known vital-sign header sequence."""
+    labels = {
+        grid.cells[index - 1].column: html.unescape(value)
+        for index, value in values.items()
+        if grid.cells[index - 1].row < grid.header_rows
+    }
+    for column, label in labels.items():
+        if re.search(r"\bBP\b|血压", label, re.I):
+            return column
+
+    # In common nursing observation tables the grouped vital-sign header is
+    # T, P, R, BP, SpO2. If OCR drops only the BP label, recover its position
+    # from the neighboring visible labels and the physical merged header.
+    for parent in grid.cells:
+        if parent.row != 0 or parent.colspan < 4:
+            continue
+        start, end = parent.column, parent.column + parent.colspan
+        children = [
+            cell for cell in grid.cells
+            if cell.row == 1 and start <= cell.column < end
+        ]
+        child_labels = {
+            cell.column: labels.get(cell.column, "")
+            for cell in children
+        }
+        t_columns = [c for c, label in child_labels.items() if re.search(r"(?:^|[^A-Z])T(?:[^A-Z]|$)|体温", label, re.I)]
+        p_columns = [c for c, label in child_labels.items() if re.search(r"(?:^|[^A-Z])P(?:[^A-Z]|$)|脉搏", label, re.I)]
+        r_columns = [c for c, label in child_labels.items() if re.search(r"(?:^|[^A-Z])R(?:[^A-Z]|$)|呼吸", label, re.I)]
+        spo2_columns = [c for c, label in child_labels.items() if re.search(r"SP\s*%|SpO.?2|血氧", label, re.I)]
+        if all(len(columns) == 1 for columns in (t_columns, p_columns, r_columns, spo2_columns)):
+            t_col, p_col, r_col, spo2_col = (
+                t_columns[0], p_columns[0], r_columns[0], spo2_columns[0],
+            )
+            if (
+                t_col + 1 == p_col
+                and p_col + 1 == r_col
+                and r_col + 2 == spo2_col
+            ):
+                return r_col + 1
+    return None
+
+
+def _join_wrapped_blood_pressure(value: str) -> str:
+    """Join whitespace introduced between vertically wrapped BP characters."""
+    value = value.strip()
+    return re.sub(r"(?<=\d)\s+(?=[\d/])|(?<=/)\s+(?=\d)", "", value)
+
+
+def _split_sequential_index_spans(
+    grid: TableGrid,
+    values: dict[int, str],
+) -> tuple[TableGrid, dict[int, str]]:
+    """Undo a false rowspan when sequential row numbers were OCRed together."""
+    serial_header = next((
+        index for index, cell in enumerate(grid.cells, 1)
+        if cell.row == 0 and cell.column == 0
+        and values[index].strip() == "序号"
+    ), None)
+    if serial_header is None:
+        return grid, values
+
+    items: list[tuple[GridCell, str]] = []
+    for index, cell in enumerate(grid.cells, 1):
+        content = values[index].strip()
+        numbers = re.findall(r"\d+", content)
+        can_split = (
+            cell.row >= grid.header_rows
+            and cell.column == 0
+            and cell.rowspan > 1
+            and len(numbers) == cell.rowspan
+            and re.fullmatch(r"\d+(?:\s+\d+)+", content) is not None
+            and all(int(right) == int(left) + 1 for left, right in zip(numbers, numbers[1:]))
+        )
+        if not can_split:
+            items.append((cell, values[index]))
+            continue
+
+        x1, _, x2, _ = cell.box
+        row_boxes = []
+        for row in range(cell.row, cell.row + cell.rowspan):
+            neighbors = [
+                other for other in grid.cells
+                if other.row == row and other.column != cell.column and other.rowspan == 1
+            ]
+            if not neighbors:
+                row_boxes = []
+                break
+            top = min(other.box[1] for other in neighbors)
+            bottom = min(other.box[3] for other in neighbors)
+            row_boxes.append((top, bottom))
+        if len(row_boxes) != cell.rowspan:
+            items.append((cell, values[index]))
+            continue
+        items.extend((
+            GridCell(cell.row + offset, cell.column, 1, 1, (x1, top, x2, bottom)),
+            number,
+        ) for offset, (number, (top, bottom)) in enumerate(zip(numbers, row_boxes)))
+
+    items.sort(key=lambda item: (item[0].row, item[0].column))
+    new_grid = TableGrid(
+        grid.rows, grid.columns, grid.header_rows,
+        tuple(cell for cell, _ in items),
+    )
+    return new_grid, {
+        index: value for index, (_, value) in enumerate(items, 1)
+    }
+
+
+async def _recognize_ruled_table(
+    block: Block,
+    image: np.ndarray,
+    sem: asyncio.Semaphore,
+    model_options: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    """Transcribe a confidently detected ruled grid by physical cell position."""
+    grid = detect_table_grid(image)
+    if grid is None:
+        return None
+
+    all_ids = tuple(range(1, len(grid.cells) + 1))
+    config = settings.oxr_model
+    bp_ids: set[int] = set()
+
+    async def recognize_batch(
+        batch_image: np.ndarray, batch_ids: tuple[int, ...],
+    ) -> str:
+        blood_pressure_ids = tuple(
+            index for index in batch_ids if index in bp_ids
+        )
+        async with sem:
+            return await _request_with_retries(
+                lambda: model_client.recognize_table_cells(
+                    batch_image, model_options,
+                    blood_pressure_ids=blood_pressure_ids,
+                ),
+                block=block,
+                attempts=config.retry_times,
+                timeout=config.timeout,
+            )
+
+    values: dict[int, str] = {}
+    header_ids = tuple(
+        index for index, cell in enumerate(grid.cells, 1)
+        if cell.row < grid.header_rows
+    )
+    header_batches = list(make_cell_batches(
+        image, grid, header_ids, enlarge_ids=header_ids,
+    ))
+    header_responses = await asyncio.gather(*(
+        recognize_batch(batch_image, batch_ids)
+        for batch_ids, batch_image in header_batches
+    ))
+    for (batch_ids, _), response in zip(header_batches, header_responses):
+        values.update(parse_indexed_cells(response, batch_ids))
+    # Use the transcribed header to identify BP by its actual grid column.
+    bp_column = _find_blood_pressure_column(grid, values)
+    bp_ids = {
+        index for index, cell in enumerate(grid.cells, 1)
+        if bp_column is not None
+        and cell.row >= grid.header_rows
+        and cell.column == bp_column
+    }
+    body_ids = tuple(
+        index for index in all_ids
+        if index not in values and index not in header_ids
+    )
+    ordinary_ids = tuple(index for index in body_ids if index not in bp_ids)
+    batches = list(make_cell_batches(image, grid, ordinary_ids))
+    batches.extend(make_cell_batches(
+        image, grid, tuple(index for index in body_ids if index in bp_ids),
+        enlarge_ids=tuple(index for index in body_ids if index in bp_ids),
+    ))
+    if not batches and not header_batches:
+        return None
+
+    responses = await asyncio.gather(*(
+        recognize_batch(batch_image, batch_ids)
+        for batch_ids, batch_image in batches
+    ))
+    for (batch_ids, _), response in zip(batches, responses):
+        parsed = parse_indexed_cells(response, batch_ids)
+        if values.keys() & parsed.keys():
+            raise ValueError("Ruled table returned duplicate cell IDs across batches.")
+        values.update(parsed)
+
+    # A missing ID is an unread cell, not permission to shift later values.
+    # Re-read only those crops, with two bounded attempts to recover them.
+    for _ in range(2):
+        missing = tuple(index for index in all_ids if index not in values)
+        if not missing:
+            break
+        logger.warning(
+            "Ruled table block %s omitted %d cell IDs; retrying only those cells.",
+            block.idx, len(missing),
+        )
+        missing_header = tuple(index for index in missing if index in header_ids)
+        missing_body = tuple(index for index in missing if index not in header_ids)
+        retry_batches = list(make_cell_batches(
+            image, grid, tuple(index for index in missing_body if index not in bp_ids),
+        ))
+        retry_batches.extend(make_cell_batches(
+            image, grid, tuple(index for index in missing_body if index in bp_ids),
+            enlarge_ids=tuple(index for index in missing_body if index in bp_ids),
+        ))
+        retry_batches.extend(make_cell_batches(
+            image, grid, missing_header, enlarge_ids=missing_header,
+        ))
+        retry_responses = await asyncio.gather(*(
+            recognize_batch(batch_image, batch_ids)
+            for batch_ids, batch_image in retry_batches
+        ))
+        for (batch_ids, _), response in zip(retry_batches, retry_responses):
+            parsed = parse_indexed_cells(response, batch_ids)
+            if values.keys() & parsed.keys():
+                raise ValueError("Ruled table retry returned an unexpected cell ID.")
+            values.update(parsed)
+
+    missing = tuple(index for index in all_ids if index not in values)
+    if 0 < len(missing) <= 32:
+        logger.warning(
+            "Ruled table block %s still lacks %d cell IDs; retrying them individually.",
+            block.idx, len(missing),
+        )
+        single_batches = [
+            next(make_cell_batches(image, grid, (index,), enlarge_ids=(index,)))
+            for index in missing
+        ]
+        single_responses = await asyncio.gather(*(
+            recognize_batch(batch_image, batch_ids)
+            for batch_ids, batch_image in single_batches
+        ))
+        for (batch_ids, _), response in zip(single_batches, single_responses):
+            parsed = parse_indexed_cells(response, batch_ids)
+            if values.keys() & parsed.keys():
+                raise ValueError("Ruled table single-cell retry returned a duplicate ID.")
+            values.update(parsed)
+
+    if values.keys() != set(all_ids):
+        raise ValueError("Ruled table cell transcription is incomplete.")
+    for index in bp_ids:
+        values[index] = _join_wrapped_blood_pressure(values[index])
+    grid, values = _split_sequential_index_spans(grid, values)
+    return render_table_grid(grid, values)
+
+
+def _is_zero_only_output(text: str) -> bool:
+    tokens = text.split()
+    return len(tokens) >= ZERO_OUTPUT_MIN_TOKENS and all(token == "0" for token in tokens)
+
+
+def _is_zero_dominated_output(text: str) -> bool:
+    """Catch zero loops wrapped in Markdown fences or a short generated prefix."""
+    body = re.sub(r"(?m)^\s*`{3,}[^\n]*$", " ", text)
+    tokens = re.findall(r"\S+", body)
+    zero_count = sum(token.strip(".,;:!?()[]{}") == "0" for token in tokens)
+    return (
+        zero_count >= ZERO_OUTPUT_MIN_TOKENS
+        and zero_count / max(1, len(tokens)) >= 0.95
+    )
 
 
 def _finish_reason(output: str) -> str:
@@ -68,26 +349,403 @@ async def _request_with_retries(
     raise AssertionError("Recognition retry loop exited unexpectedly.")
 
 
+async def _request_table_with_budget(
+    request: Callable[[], Awaitable[str]],
+    *,
+    block: Block,
+    attempts: int,
+    timeout: int,
+    budget: dict[str, int],
+) -> str:
+    """Allow one initial request per chunk plus a small structural retry pool."""
+    max_calls = budget["segments"] + budget["retries"]
+    if budget["used"] >= max_calls:
+        raise PipelineError(
+            f"Adaptive table request budget ({max_calls}) reached for block {block.idx}.",
+            status_code=502,
+            public_message="表格分段识别额度已用完。",
+        )
+    budget["used"] += 1
+    return await _request_with_retries(
+        request, block=block, attempts=attempts, timeout=timeout,
+    )
+
+
 async def _request_block(
     block: Block,
     crop_img: np.ndarray,
     sem: asyncio.Semaphore,
     model_options: Optional[Dict[str, Any]],
 ) -> str:
-    if block.type == BlockType.TABLE:
-        # recognize_table handles bounded parallelism for its row-aligned chunks.
-        return await model_client.recognize_table(crop_img, model_options)
     async with sem:
+        if block.type == BlockType.TABLE:
+            return await model_client.recognize_table(crop_img, model_options)
         if block.type == BlockType.FORMULA:
             return await model_client.recognize_formula(crop_img, model_options)
         if block.type == BlockType.CODE_BLOCK:
-            return await model_client.recognize_code(crop_img, model_options)
+            # Layout classifiers can label dense printed content (for example,
+            # medical measurements) as code. The code-specific prompt can then
+            # trigger repetitive token loops. Use general OCR for detected code
+            # regions; postprocess_code still preserves the Markdown code format.
+            return await model_client.recognize_text(crop_img, model_options)
         if block.type == BlockType.CHEMICAL_STRUCTURE:
             return await model_client.recognize_chemical_structure(
                 crop_img,
                 model_options,
             )
         return await model_client.recognize_text(crop_img, model_options)
+
+
+async def _recognize_table_image(
+    block: Block,
+    image: np.ndarray,
+    sem: asyncio.Semaphore,
+    model_options: Optional[Dict[str, Any]],
+    *,
+    depth: int = 0,
+    header_schema: Optional[str] = None,
+    request_budget: Optional[dict[str, int]] = None,
+    preserve_image_tokens: bool = False,
+) -> str:
+    """Recognize the full table crop before splitting incomplete model output."""
+    config = settings.oxr_model
+    if request_budget is None:
+        request_budget = {
+            "used": 0,
+            "segments": 1,
+            "retries": 1,
+            "retries_used": 0,
+        }
+
+    async with sem:
+        async def recognize_chunk() -> str:
+            if header_schema is None:
+                return await model_client.recognize_table(image, model_options)
+            return await model_client.recognize_table(
+                image, model_options, header_schema=header_schema,
+            )
+
+        raw = await _request_table_with_budget(
+            recognize_chunk,
+            block=block,
+            attempts=config.retry_times,
+            timeout=config.timeout,
+            budget=request_budget,
+        )
+
+    if _finish_reason(raw) != "length" and is_complete_table_html(raw):
+        widths = table_row_widths(raw)
+        if len(set(widths)) <= 1:
+            return raw
+    if _finish_reason(raw) != "length" and not is_balanced_table_html(raw):
+        repaired = repair_table_html_prefix(raw)
+        if repaired is not None:
+            logger.warning(
+                "Table block %s response omitted leading HTML tags; repairing its envelope.",
+                block.idx,
+            )
+            raw = repaired
+            if is_complete_table_html(raw):
+                return raw
+
+    # A ragged row is often caused by the model omitting an empty cell. Give it
+    # the dominant logical width and ask it to realign the same crop once.
+    expected_columns = expected_table_columns(raw)
+    if (
+        expected_columns
+        and _finish_reason(raw) != "length"
+        and request_budget["retries_used"] < request_budget["retries"]
+    ):
+        request_budget["retries_used"] += 1
+        logger.warning(
+            "Table block %s has inconsistent row widths; retrying with %d logical columns.",
+            block.idx, expected_columns,
+        )
+        async with sem:
+            retried = await _request_table_with_budget(
+                lambda: model_client.recognize_table(
+                    image, model_options,
+                    header_schema=header_schema,
+                    expected_columns=expected_columns,
+                ),
+                block=block,
+                attempts=config.retry_times,
+                timeout=config.timeout,
+                budget=request_budget,
+            )
+        if _finish_reason(retried) != "length" and not is_balanced_table_html(retried):
+            repaired = repair_table_html_prefix(retried)
+            if repaired is not None:
+                logger.warning(
+                    "Table block %s retry had missing leading HTML tags; repairing its envelope.",
+                    block.idx,
+                )
+                retried = repaired
+        if _finish_reason(retried) != "length" and is_complete_table_html(retried):
+            return retried
+        if not is_balanced_table_html(raw):
+            raw = retried
+
+    should_split = _finish_reason(raw) == "length" or not is_balanced_table_html(raw)
+    if depth < 12 and should_split and image.shape[0] > TABLE_MIN_SPLIT_HEIGHT:
+        target_height = min(
+            TABLE_RECOGNITION_CHUNK_HEIGHT, max(TABLE_MIN_SPLIT_HEIGHT, image.shape[0] // 2)
+        )
+        smaller = split_table_image_with_bounds(image, max_height=target_height)
+        if len(smaller) > 1:
+            logger.warning("Table block %s returned incomplete HTML; retrying as %d smaller chunks.", block.idx, len(smaller))
+            # Count the newly created children as baseline work; the failed
+            # parent request has already been charged.
+            request_budget["segments"] += len(smaller)
+            request_budget["retries"] = min(
+                request_budget["segments"],
+                max(1, math.ceil(request_budget["segments"] * 0.2)),
+            )
+            results = []
+            active_schema = header_schema
+            for part, _, _ in smaller:
+                recognized = await _recognize_table_image(
+                    block, part, sem, model_options, depth=depth + 1,
+                    header_schema=active_schema,
+                    request_budget=request_budget,
+                    preserve_image_tokens=preserve_image_tokens,
+                )
+                results.append(recognized)
+                if active_schema is None:
+                    active_schema = extract_table_header_schema(recognized)
+            return combine_table_chunks(results)
+
+    # Do not fail the whole document over a small row-width disagreement after
+    # schema-guided retries. Preserve closed rows for export and log the widths
+    # so the user can still review the table instead of losing every page.
+    if _finish_reason(raw) != "length" and is_balanced_table_html(raw):
+        widths = table_row_widths(raw)
+        logger.warning(
+            "Table block %s remains ragged after retries (logical row widths=%s); exporting best-effort rows.",
+            block.idx, sorted(set(widths)),
+        )
+        return raw
+
+    if depth and not preserve_image_tokens:
+        logger.warning("Table block %s has an unreadable HTML slice; reading that slice as text.", block.idx)
+        text_fallback = await _recognize_table_text_fallback(block, image, sem, model_options)
+        return text_fallback if text_fallback.strip() else raw
+
+    logger.warning(
+        "Table block %s did not produce a complete HTML table; returning the model's best-effort output.",
+        block.idx,
+    )
+    return raw
+
+
+TABLE_MIN_SPLIT_HEIGHT = 96
+TABLE_RECOGNITION_CHUNK_HEIGHT = 360
+
+
+def _table_issue_score(issues: list[str]) -> int:
+    if "no_table_rows" in issues:
+        return 100 + len(issues)
+    return len(issues)
+
+
+async def _retry_table_views(
+    block: Block,
+    image: np.ndarray,
+    current_output: str,
+    sem: asyncio.Semaphore,
+    model_options: Optional[Dict[str, Any]],
+    *,
+    context_text: str = "",
+) -> str:
+    """Re-read suspicious tables from enhanced and quarter-turned source crops."""
+    issues = table_quality_issues(current_output, image.shape[0], context_text)
+    if not issues:
+        return current_output
+
+    logger.warning(
+        "Table block %s failed content checks (%s); retrying the same OXR model "
+        "on enhanced and rotated crops.",
+        block.idx, ", ".join(issues),
+    )
+    height, width = image.shape[:2]
+    scale = min(1.75, max(1.0, 2200 / max(height, width)))
+    if scale > 1.0:
+        enhanced = cv2.resize(
+            image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC,
+        )
+    else:
+        enhanced = image.copy()
+
+    candidates = [
+        ("high-resolution", enhanced),
+        ("rotated-90", np.rot90(enhanced, 1).copy()),
+        ("rotated-180", np.rot90(enhanced, 2).copy()),
+        ("rotated-270", np.rot90(enhanced, 3).copy()),
+    ]
+    best_output = current_output
+    best_score = _table_issue_score(issues)
+    for label, candidate in candidates:
+        try:
+            recognized = await _recognize_table_view(
+                block, candidate, sem, model_options,
+            )
+        except (PipelineError, ValueError) as error:
+            logger.warning(
+                "Table block %s %s retry failed (%s).",
+                block.idx, label, type(error).__name__,
+            )
+            continue
+        candidate_issues = table_quality_issues(
+            recognized, candidate.shape[0], context_text,
+        )
+        score = _table_issue_score(candidate_issues)
+        logger.info(
+            "Table block %s %s retry quality score=%d issues=%s.",
+            block.idx, label, score, ", ".join(candidate_issues) or "none",
+        )
+        if score < best_score:
+            best_output = recognized
+            best_score = score
+        if score == 0:
+            return recognized
+
+    return best_output
+
+
+async def _recognize_table_view(
+    block: Block,
+    image: np.ndarray,
+    sem: asyncio.Semaphore,
+    model_options: Optional[Dict[str, Any]],
+) -> str:
+    """Recognize a recovery view in row-aligned chunks when it is long."""
+    chunks = split_table_image_with_bounds(
+        image, max_height=TABLE_RECOGNITION_CHUNK_HEIGHT,
+    )
+    if len(chunks) <= 1:
+        return await _recognize_table_image(block, image, sem, model_options)
+
+    logger.info(
+        "Table block %s recovery view split into %d row-aligned chunks.",
+        block.idx, len(chunks),
+    )
+    responses: list[str] = []
+    header_schema: Optional[str] = None
+    for chunk, _, _ in chunks:
+        response = await _recognize_table_image(
+            block, chunk, sem, model_options, header_schema=header_schema,
+        )
+        responses.append(response)
+        if header_schema is None:
+            header_schema = extract_table_header_schema(response)
+    return combine_table_chunks(responses)
+
+async def _recognize_table_text_fallback(
+    block: Block,
+    image: np.ndarray,
+    sem: asyncio.Semaphore,
+    model_options: Optional[Dict[str, Any]],
+) -> str:
+    """Use the same vision model to preserve table text if HTML OCR fails."""
+    config = settings.oxr_model
+
+    async def recognize_piece(piece: np.ndarray, depth: int = 0) -> List[str]:
+        output = ""
+        try:
+            async with sem:
+                output = await _request_with_retries(
+                    lambda: model_client.recognize_table_as_text(piece, model_options),
+                    block=block,
+                    attempts=config.retry_times,
+                    timeout=config.timeout,
+                )
+        except PipelineError as error:
+            logger.warning(
+                "Table block %s text OCR failed for a %dpx crop (%s); trying smaller crops.",
+                block.idx, piece.shape[0], type(error).__name__,
+            )
+        if output.strip() and _finish_reason(output) != "length":
+            return [output.strip()]
+
+        height = piece.shape[0]
+        if depth >= 8 or height <= TABLE_MIN_SPLIT_HEIGHT:
+            if output.strip():
+                logger.warning(
+                    "Table block %s text OCR remains truncated at the minimum crop; keeping the partial model output.",
+                    block.idx,
+                )
+                return [output.strip()]
+            logger.warning(
+                "Table block %s text OCR returned no content at the minimum crop; skipping this empty crop.",
+                block.idx,
+            )
+            return []
+
+        target_height = max(TABLE_MIN_SPLIT_HEIGHT, height // 2)
+        smaller = split_table_image(piece, max_height=target_height)
+        if len(smaller) <= 1:
+            midpoint = height // 2
+            overlap = min(12, max(1, height // 16))
+            smaller = [
+                piece[:midpoint + overlap].copy(),
+                piece[midpoint - overlap:].copy(),
+            ]
+        logger.warning(
+            "Table block %s text OCR was truncated; splitting %dpx segment into %d smaller crops.",
+            block.idx, height, len(smaller),
+        )
+        results: List[str] = []
+        for child in smaller:
+            results.extend(await recognize_piece(child, depth + 1))
+        # Prefer finer child OCR when it produced text; if every child was
+        # empty, retain any partial text returned for the parent crop.
+        return results or ([output.strip()] if output.strip() else [])
+
+    chunks = split_table_image(image, max_height=TABLE_RECOGNITION_CHUNK_HEIGHT)
+    responses: List[str] = []
+    for chunk in chunks:
+        responses.extend(await recognize_piece(chunk))
+
+    table_responses: List[str] = []
+    for response in responses:
+        candidate = strip_table_code_fence(response).strip()
+        decoded = html.unescape(candidate)
+        recognized_table = next((
+            value for value in (candidate, decoded)
+            if is_balanced_table_html(value)
+        ), None)
+        if recognized_table is not None:
+            table_responses.append(recognized_table)
+    if len(table_responses) == len(responses) and table_responses:
+        return (
+            table_responses[0]
+            if len(table_responses) == 1
+            else combine_table_chunks(table_responses)
+        )
+
+    lines: List[str] = []
+    for response in responses:
+        candidate = html.unescape(strip_table_code_fence(response)).strip()
+        if is_balanced_table_html(candidate):
+            parser = _TableParser()
+            parser.feed(candidate)
+            lines.extend("\t".join(cell.text for cell in row) for row in parser.rows)
+        else:
+            lines.extend(candidate.splitlines())
+    rows = "".join(
+        "<tr>" + "".join(
+            "<td>" + html.escape(cell) + "</td>"
+            for cell in line.split("\t")
+        ) + "</tr>"
+        for line in lines
+    )
+    if not rows:
+        logger.warning(
+            "Table block %s produced no text after HTML and text OCR fallbacks; returning an empty table block.",
+            block.idx,
+        )
+        return ""
+    return "<table><tbody>" + rows + "</tbody></table>"
 
 
 async def recognize_block(
@@ -100,15 +758,17 @@ async def recognize_block(
     element_formats: Optional[Dict[str, str]] = None,
     table_images: Optional[List[Block]] = None,
 ) -> Block:
-    crop_bbox = block.bbox
+    crop_img = crop_image(page_image, block.bbox)
+    grid_crop_img = None
     if block.type == BlockType.TABLE:
+        page_h, page_w = page_image.shape[:2]
         x1, y1, x2, y2 = block.bbox
-        # Layout boxes can stop just inside the outer table rules. Preserve a
-        # small page margin so grid-based colspan correction can see those
-        # boundary lines in the recognition crop.
-        margin = max(12, min(24, round(min(x2 - x1, y2 - y1) * 0.01)))
-        crop_bbox = [x1 - margin, y1 - margin, x2 + margin, y2 + margin]
-    crop_img = crop_image(page_image, crop_bbox)
+        grid_crop_img = crop_image(page_image, [
+            max(0, x1 - TABLE_GRID_CROP_MARGIN),
+            max(0, y1 - TABLE_GRID_CROP_MARGIN),
+            min(page_w, x2 + TABLE_GRID_CROP_MARGIN),
+            min(page_h, y2 + TABLE_GRID_CROP_MARGIN),
+        ])
     element_formats = element_formats or {}
 
     if block.type == BlockType.PICTURE:
@@ -120,29 +780,162 @@ async def recognize_block(
     ):
         return await asyncio.to_thread(postprocess_picture, block, crop_img, file_name, page_num)
 
+    if block.type in {
+        BlockType.TABLE,
+        BlockType.TEXT,
+        BlockType.TITLE,
+        BlockType.CAPTION,
+        BlockType.FOOTNOTE,
+        BlockType.PAGE_HEADER,
+        BlockType.PAGE_FOOTER,
+        BlockType.STAMP,
+        BlockType.CODE_BLOCK,
+    }:
+        crop_img = await asyncio.to_thread(preprocess_text_image, crop_img)
+
     sources: Dict[int, str] = {}
     if table_images:
         try:
             crop_img, sources = await asyncio.to_thread(prepare_table_images, block, table_images, page_image)
         except ValueError as error:
-            logger.warning("Table %s image placeholders skipped: %s; preserving original table image.", block.idx, error)
+            logger.warning("Table %s image placeholders skipped: %s; using table text OCR.", block.idx, error)
             mark_table_images(table_images)
-            return await asyncio.to_thread(table_image_fallback, block, page_image)
+            raw_out = await _recognize_table_text_fallback(
+                block, crop_img, sem, model_options,
+            )
+            raw_out = await _retry_table_views(
+                block, crop_img, raw_out, sem, model_options,
+            )
+            return postprocess_table(block, raw_out, element_formats.get("table", "html"))
 
     config = settings.oxr_model
     try:
-        raw_out = await _request_with_retries(
-            lambda: _request_block(block, crop_img, sem, model_options),
-            block=block,
-            attempts=config.retry_times,
-            timeout=config.timeout,
-        )
-    except PipelineError:
-        if not table_images:
+        if block.type == BlockType.TABLE:
+            if not sources:
+                assert grid_crop_img is not None
+                try:
+                    raw_out = await _recognize_ruled_table(
+                        block, grid_crop_img, sem, model_options,
+                    )
+                except (PipelineError, ValueError) as error:
+                    logger.warning(
+                        "Ruled-grid OCR failed for table %s (%s); falling back to full-table OCR.",
+                        block.idx, type(error).__name__,
+                    )
+                    raw_out = None
+                if raw_out is None:
+                    logger.info(
+                        "Table block %s has no usable ruled grid; using full-table OCR.",
+                        block.idx,
+                    )
+                    raw_out = await _recognize_table_image(
+                        block, crop_img, sem, model_options,
+                    )
+                    raw_out = await _retry_table_views(
+                        block, crop_img, raw_out, sem, model_options,
+                    )
+            else:
+                raw_out = await _recognize_table_image(
+                    block, crop_img, sem, model_options,
+                    preserve_image_tokens=True,
+                )
+        else:
+            raw_out = await _request_with_retries(
+                lambda: _request_block(block, crop_img, sem, model_options),
+                block=block,
+                attempts=config.retry_times,
+                timeout=config.timeout,
+            )
+    except (PipelineError, ValueError) as error:
+        if block.type != BlockType.TABLE:
             raise
-        logger.warning("Table %s placeholder recognition failed; preserving original table image.", block.idx)
-        mark_table_images(table_images)
-        return await asyncio.to_thread(table_image_fallback, block, page_image)
+        logger.error("Table %s failed after adaptive row splitting: %s; trying same-model text OCR.", block.idx, error)
+        if table_images:
+            mark_table_images(table_images)
+        raw_out = await _recognize_table_text_fallback(
+            block, crop_img, sem, model_options,
+        )
+        raw_out = await _retry_table_views(
+            block, crop_img, raw_out, sem, model_options,
+        )
+        return postprocess_table(block, raw_out, element_formats.get("table", "html"))
+
+    if block.type == BlockType.CODE_BLOCK and (
+        _is_zero_only_output(raw_out)
+        or _is_zero_dominated_output(raw_out)
+        or _finish_reason(raw_out) == "length"
+    ):
+        logger.warning(
+            "Code block %s returned a zero-dominated or truncated response; retrying with text recognition.",
+            block.idx,
+        )
+        fallback_options = _length_recovery_options(model_options)
+        try:
+            async with sem:
+                fallback_out = await _request_with_retries(
+                    lambda: model_client.recognize_text(crop_img, fallback_options),
+                    block=block,
+                    attempts=config.retry_times,
+                    timeout=config.timeout,
+                )
+        except PipelineError as error:
+            logger.warning(
+                "Text fallback failed for code block %s (%s); dropping malformed output.",
+                block.idx,
+                type(error).__name__,
+            )
+            fallback_out = ""
+
+        if (
+            not fallback_out
+            or _is_zero_only_output(fallback_out)
+            or _is_zero_dominated_output(fallback_out)
+            or _finish_reason(fallback_out) == "length"
+        ):
+            logger.warning(
+                "Code block %s remained zero-dominated or truncated after text fallback; dropping it.",
+                block.idx,
+            )
+            block.content = ""
+            block.format = ContentFormat.TEXT
+            block.type = BlockType.TEXT
+            return block
+
+        # The text prompt recovered ordinary document content; don't wrap it as code.
+        block.type = BlockType.TEXT
+        raw_out = fallback_out
+
+    if _is_zero_only_output(raw_out):
+        zero_count = len(raw_out.split())
+        retry_options = _length_recovery_options(model_options)
+        logger.warning(
+            "Recognition returned a repeated-zero block (tokens=%d); retrying with repetition penalty %.1f.",
+            zero_count,
+            retry_options["repetition_penalty"],
+        )
+        try:
+            retried_out = await _request_with_retries(
+                lambda: _request_block(block, crop_img, sem, retry_options),
+                block=block,
+                attempts=config.retry_times,
+                timeout=config.timeout,
+            )
+        except PipelineError as error:
+            logger.warning(
+                "Repeated-zero retry failed for block %s (%s); dropping the malformed block.",
+                block.idx,
+                type(error).__name__,
+            )
+            retried_out = ""
+        if _is_zero_only_output(retried_out):
+            logger.warning(
+                "Repeated-zero retry remained malformed for block %s; dropping the block.",
+                block.idx,
+            )
+            block.content = ""
+            block.format = ContentFormat.TEXT
+            return block
+        raw_out = retried_out
 
     if _finish_reason(raw_out) == "length":
         recovery_image: Optional[np.ndarray] = None
@@ -191,11 +984,15 @@ async def recognize_block(
                     timeout=config.timeout,
                 )
             except PipelineError:
-                if not table_images:
+                if block.type != BlockType.TABLE:
                     raise
-                logger.warning("Table %s placeholder recovery failed; preserving original table image.", block.idx)
-                mark_table_images(table_images)
-                return await asyncio.to_thread(table_image_fallback, block, page_image)
+                logger.error("Table %s truncated response could not be recovered.", block.idx)
+                if table_images:
+                    mark_table_images(table_images)
+                raw_out = await _recognize_table_text_fallback(
+                    block, crop_img, sem, model_options,
+                )
+                return postprocess_table(block, raw_out, element_formats.get("table", "html"))
             if _finish_reason(raw_out) == "length":
                 logger.warning(
                     "Recognition output remained truncated for block %s (%s) "
@@ -206,18 +1003,16 @@ async def recognize_block(
                     recovery_method,
                 )
 
-    if block.type != BlockType.TABLE:
-        # Normalize OCR loops before type-specific formatting so text, formulas,
-        # code, and other textual recognizers all receive the same cleanup.
-        raw_out = postprocess_repetition_loops(raw_out)
-
     if block.type == BlockType.TABLE:
         if table_images:
             restored = restore_table_images(raw_out, sources)
             mark_table_images(table_images)
             if restored is None or _finish_reason(raw_out) == "length":
-                logger.warning("Table %s has incomplete image IDs/output; preserving original table image.", block.idx)
-                return await asyncio.to_thread(table_image_fallback, block, page_image)
+                logger.warning("Table %s has incomplete image IDs/output; retrying table text OCR.", block.idx)
+                raw_out = await _recognize_table_text_fallback(
+                    block, crop_img, sem, model_options,
+                )
+                return postprocess_table(block, raw_out, element_formats.get("table", "html"))
             raw_out = restored
         return postprocess_table(
             block,
@@ -240,12 +1035,42 @@ async def recognize_pages(
     semaphore: asyncio.Semaphore,
     model_options: Optional[Dict[str, Any]] = None,
     element_formats: Optional[Dict[str, str]] = None,
+    progress_callback: Optional[Callable[[dict[str, int]], Awaitable[None]]] = None,
 ) -> List[List[Block]]:
     """Run recognition for all blocks across all pages concurrently."""
     if len(pages_blocks) != len(pages_images):
         raise ValueError("Page block and image counts must match")
-
     tasks = []
+    block_total = sum(len(blocks) for blocks in pages_blocks)
+    block_completed = 0
+    page_remaining = [len(blocks) for blocks in pages_blocks]
+    page_completed = sum(1 for remaining in page_remaining if remaining == 0)
+    progress_lock = asyncio.Lock()
+
+    async def track_progress(page_idx: int, task):
+        nonlocal block_completed, page_completed
+        result = await task
+        if progress_callback is not None:
+            async with progress_lock:
+                block_completed += 1
+                page_remaining[page_idx] -= 1
+                if page_remaining[page_idx] == 0:
+                    page_completed += 1
+                await progress_callback({
+                    "block_completed": block_completed,
+                    "block_total": block_total,
+                    "pages_completed": page_completed,
+                    "page_total": len(pages_blocks),
+                })
+        return result
+
+    if progress_callback is not None and block_total == 0:
+        await progress_callback({
+            "block_completed": 0,
+            "block_total": 0,
+            "pages_completed": len(pages_blocks),
+            "page_total": len(pages_blocks),
+        })
     # keep track of which task belongs to which page and block index
     # tasks structure: (page_idx, block_idx, task)
     for page_idx, (blocks, image) in enumerate(zip(pages_blocks, pages_images)):
@@ -266,6 +1091,8 @@ async def recognize_pages(
                     block, image, semaphore, file_name, page_idx,
                     model_options, element_formats, **kwargs,
                 )
+            if progress_callback is not None:
+                task = track_progress(page_idx, task)
             tasks.append((page_idx, block_idx, task))
 
     # Run all tasks
@@ -278,4 +1105,114 @@ async def recognize_pages(
     for (page_idx, block_idx, _), block_result in zip(tasks, gathered_results):
         final_pages_blocks[page_idx][block_idx] = block_result
 
-    return [[block for block in page if block is not None] for page in final_pages_blocks]
+    recognized_pages = [
+        [block for block in page if block is not None]
+        for page in final_pages_blocks
+    ]
+
+    if settings.pipeline.verify_text_with_oxr:
+        text_types = {
+            BlockType.TEXT, BlockType.TITLE, BlockType.CAPTION,
+            BlockType.FOOTNOTE, BlockType.PAGE_HEADER, BlockType.PAGE_FOOTER,
+            BlockType.STAMP,
+        }
+        async def verify_page(page_idx: int, blocks: List[Block]) -> None:
+            candidates = [
+                (local_idx, block)
+                for local_idx, block in enumerate(blocks)
+                if block.type in text_types and block.content
+            ]
+            if not candidates:
+                return
+            request_blocks = [
+                {"id": str(local_idx), "text": block.content}
+                for local_idx, block in candidates
+            ]
+            async with semaphore:
+                try:
+                    response = await _request_with_retries(
+                        lambda: model_client.verify_page_text(
+                            pages_images[page_idx], request_blocks, model_options,
+                        ),
+                        block=candidates[0][1],
+                        attempts=settings.oxr_model.retry_times,
+                        timeout=settings.oxr_model.timeout,
+                    )
+                except PipelineError:
+                    logger.warning(
+                        "OXR text verification failed for page %d; preserving original OCR.",
+                        page_idx + 1,
+                        exc_info=True,
+                    )
+                    return
+            try:
+                verified = json.loads(response)
+                if not isinstance(verified, dict):
+                    raise ValueError("verification response must be a JSON object")
+            except (TypeError, ValueError):
+                logger.warning(
+                    "OXR text verification returned invalid JSON for page %d; "
+                    "preserving original OCR: %r",
+                    page_idx + 1, response,
+                )
+                return
+            expected_ids = {str(local_idx) for local_idx, _ in candidates}
+            if set(verified) != expected_ids or any(
+                not isinstance(value, str) for value in verified.values()
+            ):
+                logger.warning(
+                    "OXR text verification returned mismatched block ids for page %d; "
+                    "preserving original OCR.",
+                    page_idx + 1,
+                )
+                return
+            for local_idx, block in candidates:
+                candidate = verified[str(local_idx)].strip()
+                if candidate != block.content:
+                    mode = settings.pipeline.text_verification_mode
+                    logger.warning(
+                        "OXR text verification %s page=%d block=%d "
+                        "original=%r candidate=%r.",
+                        "applied" if mode == "apply" else "candidate",
+                        page_idx + 1, local_idx, block.content, candidate,
+                    )
+                    if mode == "apply":
+                        block.content = candidate
+
+        await asyncio.gather(*(
+            verify_page(page_idx, blocks)
+            for page_idx, blocks in enumerate(recognized_pages)
+        ))
+
+    # Cross-check RECIST baseline dates against the nearby imaging reports.
+    # This runs after page OCR so it can use actual document context, then
+    # re-reads only suspicious table crops with the same model.
+    for page_idx, blocks in enumerate(recognized_pages):
+        nearby_pages = range(max(0, page_idx - 1), min(len(recognized_pages), page_idx + 2))
+        context_text = "\n".join(
+            block.content
+            for nearby_idx in nearby_pages
+            for block in recognized_pages[nearby_idx]
+            if block.type != BlockType.TABLE and block.content
+        )
+        for block in blocks:
+            if block.type != BlockType.TABLE or not block.content:
+                continue
+            issues = table_quality_issues(
+                block.content,
+                crop_image(pages_images[page_idx], block.bbox).shape[0],
+                context_text,
+            )
+            if "baseline_date_conflicts_with_adjacent_reports" not in issues:
+                continue
+            crop_img = crop_image(pages_images[page_idx], block.bbox)
+            corrected = await _retry_table_views(
+                block, crop_img, block.content, semaphore, model_options,
+                context_text=context_text,
+            )
+            if corrected != block.content:
+                block.content = postprocess_table(
+                    block, corrected, (element_formats or {}).get("table", "html"),
+                ).content
+
+    return recognized_pages

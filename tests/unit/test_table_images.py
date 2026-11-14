@@ -165,12 +165,196 @@ def test_recognition_preserves_ro_index_space_without_extra_picture_files(
     assert not list(tmp_path.iterdir())
 
 
+def test_table_recognition_uses_same_model_text_fallback_after_structure_fails(monkeypatch):
+    image, table, _, _ = scene()
+    calls = []
+
+    async def fail_table(*_args, **_kwargs):
+        raise ValueError("table structure could not be recovered")
+
+    async def read_table_as_text(_image, _options=None):
+        calls.append("same-model-table-text")
+        return "事件：眼痛\t1级：轻微\t2级：中度"
+
+    monkeypatch.setattr(
+        "oxr.pipeline.recognition._recognize_table_image", fail_table
+    )
+    monkeypatch.setattr(
+        "oxr.pipeline.recognition.model_client.recognize_table_as_text",
+        read_table_as_text,
+        raising=False,
+    )
+    result = asyncio.run(
+        recognize_block(table, image, asyncio.Semaphore(1), "demo.png", 0)
+    )
+
+    assert calls == ["same-model-table-text"]
+    assert "眼痛" in result.content and "轻微" in result.content and "中度" in result.content
+    assert result.content.count("<td>") == 3
+    assert "该表格区域仍有内容未能识别" not in result.content
+
+
+def test_tall_table_keeps_full_context_when_first_response_is_complete(monkeypatch):
+    image = np.full((520, 260, 3), 255, dtype=np.uint8)
+    table = block(8, BlockType.TABLE, [10, 10, 250, 510])
+    heights = []
+
+    async def read_table(crop, _options=None, **_kwargs):
+        heights.append(crop.shape[0])
+        return "<table><tr><td>眼痛</td></tr></table>"
+
+    monkeypatch.setattr("oxr.pipeline.recognition.model_client.recognize_table", read_table)
+
+    result = asyncio.run(recognize_block(table, image, asyncio.Semaphore(1), "demo.png", 0))
+
+    assert heights == [500]
+    assert result.content.count("眼痛") == 1
+
+
+def test_visible_text_at_page_boundary_is_sent_to_model(monkeypatch):
+    image = np.full((100, 120, 3), 255, dtype=np.uint8)
+    image[:3, 10:110] = 0
+    text_block = block(8, BlockType.TEXT, [10, 0, 110, 20])
+
+    async def read_text(crop, _options=None):
+        np.testing.assert_array_equal(crop, image[:20, 10:110])
+        return "Visible text"
+
+    monkeypatch.setattr("oxr.pipeline.recognition.model_client.recognize_text", read_text)
+
+    result = asyncio.run(recognize_block(text_block, image, asyncio.Semaphore(1), "demo.png", 0))
+
+    assert result.content == "Visible text"
+
+
+def test_failed_table_slice_does_not_replace_structured_sibling(monkeypatch):
+    image, table, _, _ = scene()
+    text_heights = []
+
+    async def read_table(crop, _options=None, **_kwargs):
+        if crop.shape[0] == 160:
+            return ModelOutput("<table>", finish_reason="length")
+        if crop.shape[0] == 79:
+            return '<table><tr><td colspan="2">保留原合并格</td></tr></table>'
+        return "broken structure"
+
+    def split(crop, max_height):
+        return [(crop[:79], 0, 79), (crop[79:], 79, 160)]
+
+    async def read_text(crop, _options=None):
+        text_heights.append(crop.shape[0])
+        return "眼痛\t轻微"
+
+    monkeypatch.setattr("oxr.pipeline.recognition.model_client.recognize_table", read_table)
+    monkeypatch.setattr("oxr.pipeline.recognition.model_client.recognize_table_as_text", read_text)
+    monkeypatch.setattr("oxr.pipeline.recognition.split_table_image_with_bounds", split)
+
+    result = asyncio.run(recognize_block(table, image, asyncio.Semaphore(1), "demo.png", 0))
+
+    assert text_heights == [81]
+    assert 'colspan="2">保留原合并格' in result.content
+    assert "眼痛" in result.content
+
+
+def test_truncated_table_text_fallback_splits_into_smaller_model_requests(monkeypatch):
+    image, table, _, _ = scene()
+    heights = []
+
+    async def fail_table(*_args, **_kwargs):
+        raise ValueError("table structure could not be recovered")
+
+    async def read_table_as_text(crop, _options=None):
+        heights.append(crop.shape[0])
+        if crop.shape[0] > 100:
+            return ModelOutput("partial", finish_reason="length")
+        return "识别行"
+
+    def split_text(_image, max_height):
+        if max_height >= 300:
+            return [_image]
+        return [_image[:80], _image[80:]]
+
+    monkeypatch.setattr("oxr.pipeline.recognition._recognize_table_image", fail_table)
+    monkeypatch.setattr("oxr.pipeline.recognition.split_table_image", split_text)
+    monkeypatch.setattr(
+        "oxr.pipeline.recognition.model_client.recognize_table_as_text",
+        read_table_as_text,
+    )
+    result = asyncio.run(
+        recognize_block(table, image, asyncio.Semaphore(1), "demo.png", 0)
+    )
+
+    assert heights == [160, 80, 80]
+    assert result.content.count("识别行") == 2
+
+
+def test_table_text_fallback_restores_html_returned_as_escaped_text(monkeypatch):
+    image, table, _, _ = scene()
+
+    async def fail_table(*_args, **_kwargs):
+        raise ValueError("table structure could not be recovered")
+
+    async def html_as_text(_image, _options=None):
+        return (
+            "&lt;table&gt;&lt;tr&gt;&lt;td&gt;事件&lt;/td&gt;"
+            "&lt;td&gt;分级1&lt;/td&gt;&lt;/tr&gt;"
+            "&lt;tr&gt;&lt;td&gt;眼痛&lt;/td&gt;&lt;td&gt;轻微&lt;/td&gt;"
+            "&lt;/tr&gt;&lt;/table&gt;"
+        )
+
+    monkeypatch.setattr("oxr.pipeline.recognition._recognize_table_image", fail_table)
+    monkeypatch.setattr(
+        "oxr.pipeline.recognition.model_client.recognize_table_as_text", html_as_text
+    )
+    result = asyncio.run(
+        recognize_block(table, image, asyncio.Semaphore(1), "demo.png", 0)
+    )
+
+    assert result.content.count("<table") == 1
+    assert result.content.count("<tr>") == 2
+    assert "&lt;table&gt;" not in result.content
+    assert "眼痛" in result.content and "轻微" in result.content
+
+
+def test_truncated_table_text_fallback_returns_partial_model_text(monkeypatch):
+    image, table, _, _ = scene()
+    heights = []
+
+    async def fail_table(*_args, **_kwargs):
+        raise ValueError("table structure could not be recovered")
+
+    async def truncated_text(crop, _options=None):
+        heights.append(crop.shape[0])
+        return ModelOutput("已识别到的单元格内容", finish_reason="length")
+
+    def split_in_half(crop, max_height):
+        if max_height >= 300:
+            return [crop]
+        return [crop[:80], crop[80:]]
+
+    monkeypatch.setattr("oxr.pipeline.recognition._recognize_table_image", fail_table)
+    monkeypatch.setattr("oxr.pipeline.recognition.split_table_image", split_in_half)
+    monkeypatch.setattr(
+        "oxr.pipeline.recognition.model_client.recognize_table_as_text",
+        truncated_text,
+    )
+    result = asyncio.run(
+        recognize_block(table, image, asyncio.Semaphore(1), "demo.png", 0)
+    )
+
+    assert heights == [160, 80, 80]
+    assert result.type == BlockType.TABLE
+    assert result.content.count("已识别到的单元格内容") == 2
+    assert "该表格区域仍有内容未能识别" not in result.content
+
+
 @pytest.mark.parametrize(
     "failure", ["missing", "length", "request", "retry_request", "tiny"]
 )
-def test_recognition_fallback_retains_original_full_table(monkeypatch, failure):
+def test_recognition_fallback_ocr_preserves_table_text(monkeypatch, failure):
     image, table, first, second = scene()
     calls = []
+    text_calls = []
 
     async def table_request(_image, _options=None):
         calls.append(_image.shape)
@@ -182,11 +366,18 @@ def test_recognition_fallback_retains_original_full_table(monkeypatch, failure):
             )
         return "<table><tr><td><tit>1</td></tr></table>"
 
+    async def text_request(_image, _options=None):
+        text_calls.append("text")
+        return "补充识别文本"
+
     if failure == "tiny":
         first.bbox = [20, 20, 25, 25]
     monkeypatch.setattr(settings.oxr_model, "retry_times", 1)
     monkeypatch.setattr(
         "oxr.pipeline.recognition.model_client.recognize_table", table_request
+    )
+    monkeypatch.setattr(
+        "oxr.pipeline.recognition.model_client.recognize_table_as_text", text_request
     )
     result = asyncio.run(
         recognize_block(
@@ -200,13 +391,10 @@ def test_recognition_fallback_retains_original_full_table(monkeypatch, failure):
     )
     assert result.type == BlockType.TABLE
     assert result.format == ContentFormat.HTML
-    assert result.content.startswith('<img alt="Table" src="data:image/png;base64,')
-    data = result.content.split("base64,")[1].split('"')[0]
-    raster = cv2.imdecode(
-        np.frombuffer(base64.b64decode(data), dtype=np.uint8), cv2.IMREAD_COLOR
-    )
-    np.testing.assert_array_equal(raster, image[10:170, 10:250])
+    assert "补充识别文本" in result.content
+    assert "该表格区域仍有内容未能识别" not in result.content
     assert first.generated_role == second.generated_role == TABLE_IMAGE_ROLE
+    assert text_calls == ["text"]
     assert len(calls) == ({"tiny": 0, "length": 2, "retry_request": 2}.get(failure, 1))
 
 

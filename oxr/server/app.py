@@ -41,6 +41,11 @@ app.include_router(demo_router, prefix="/v1")
 DEMO_DIR = Path(__file__).parent / "demo"
 
 
+@app.get("/workbench", include_in_schema=False)
+async def workbench_page():
+    return FileResponse(DEMO_DIR / "workbench.html", headers={"Cache-Control": "no-cache"})
+
+
 @app.get("/demo", include_in_schema=False)
 @app.get("/demo/", include_in_schema=False)
 async def demo_page():

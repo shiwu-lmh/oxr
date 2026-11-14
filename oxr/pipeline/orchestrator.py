@@ -1,11 +1,12 @@
 from copy import deepcopy
 import asyncio
+import logging
 import os
 import time
 import cv2
 import numpy as np
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 from oxr.config.settings import settings
 from oxr.model.client import model_client
@@ -30,15 +31,31 @@ from oxr.pipeline.postprocess.overlap_dedupe import (
     dedupe_visual_parents,
     dedupe_complete_text,
 )
-from oxr.pipeline.postprocess.exact_text_dedupe import dedupe_exact_textual_blocks
+from oxr.pipeline.postprocess.exact_text_dedupe import (
+    dedupe_contained_text_blocks,
+    dedupe_exact_textual_blocks,
+)
 from oxr.pipeline.postprocess.full_overlap_dedupe import (
     dedupe_full_overlaps,
     dedupe_table_edge_text,
 )
 from oxr.pipeline.postprocess.table_images import TABLE_IMAGE_ROLE
+from oxr.pipeline.postprocess.heading_hierarchy import assign_heading_levels
+from oxr.pipeline.postprocess.cross_page_stitch import stitch_markdown_pages
 
 
 INVALID_DOCUMENT_MESSAGE = "Unable to decode document into valid page images."
+logger = logging.getLogger(__name__)
+ProgressCallback = Callable[[dict[str, Any]], Awaitable[None]]
+
+
+async def _emit_progress(callback: Optional[ProgressCallback], **progress: Any) -> None:
+    if callback is None:
+        return
+    try:
+        await callback(progress)
+    except Exception:
+        logger.warning("Progress callback failed; continuing document parsing.", exc_info=True)
 
 # Internal processing policy; not configurable through YAML or environment.
 _SYSTEMATIC_CROSS_CATEGORY_DEDUPE = True
@@ -92,12 +109,23 @@ async def process_document(
     keep_header_footer: bool = False,
     model_options: Optional[Dict[str, Any]] = None,
     element_formats: Optional[Dict[str, str]] = None,
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> Dict[str, Any]:
     start_time = time.perf_counter()
+    await _emit_progress(
+        progress_callback, stage="decode", label="读取文件", percent=2,
+        detail="正在读取文件并转换页面。",
+    )
     images = await asyncio.to_thread(_decode_document_images, file_bytes, file_name)
+    await _emit_progress(
+        progress_callback, stage="layout", label="版面分析", percent=5,
+        detail=f"文件已读取，共 {len(images)} 页；开始分析页面版面。",
+        completed_pages=0, total_pages=len(images),
+    )
     return await process_decoded_document(
         images, file_name, output_formats, keep_header_footer,
         model_options, element_formats, started_at=start_time,
+        progress_callback=progress_callback,
     )
 
 
@@ -113,6 +141,7 @@ async def process_decoded_document(
     asset_dir: Optional[Path] = None,
     asset_url_prefix: str = "",
     started_at: Optional[float] = None,
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> Dict[str, Any]:
     """Recognize already-decoded pages, optionally collecting demo source maps."""
     assets = ImageAssets(Path(asset_dir), asset_url_prefix) if asset_dir is not None else None
@@ -121,6 +150,7 @@ async def process_decoded_document(
         return await _process_decoded_document(
             images, file_name, output_formats, keep_header_footer,
             model_options, element_formats, demo, started_at,
+            progress_callback,
         )
     finally:
         image_assets.reset(token)
@@ -129,16 +159,45 @@ async def process_decoded_document(
 async def _process_decoded_document(
     images, file_name, output_formats, keep_header_footer,
     model_options, element_formats, demo, started_at,
+    progress_callback,
 ):
     start_time = started_at if started_at is not None else time.perf_counter()
     full_overlap_dedupe = settings.pipeline.full_overlap_dedupe
     ext = os.path.splitext(file_name)[1].lower()
     page_num = len(images)
+    text_dedupe = settings.pipeline.text_dedupe
     decode_end_time = time.perf_counter()
 
     # 2. Phase 1: Layout Analysis
-    pages_blocks = await analyze_layouts(images, model_options)
+    if progress_callback is not None:
+        await _emit_progress(
+            progress_callback, stage="layout", label="版面分析", percent=5,
+            detail=f"正在分析版面：0/{page_num} 页。",
+            completed_pages=0, total_pages=page_num,
+        )
+
+    async def on_layout_progress(event: dict[str, int]) -> None:
+        completed = event["completed_pages"]
+        total = event["total_pages"]
+        percent = 5 + round(15 * completed / max(total, 1))
+        await _emit_progress(
+            progress_callback, stage="layout", label="版面分析", percent=percent,
+            detail=f"版面分析：已完成 {completed}/{total} 页。",
+            completed_pages=completed, total_pages=total,
+        )
+
+    pages_blocks = await analyze_layouts(
+        images, model_options,
+        progress_callback=on_layout_progress if progress_callback else None,
+    )
     layout_end_time = time.perf_counter()
+    # Omit image-only regions from recognition and exports; page images remain
+    # available to local layout analysis and printed-text crops.
+    image_only_types = {BlockType.PICTURE, BlockType.CHEMICAL_STRUCTURE}
+    pages_blocks = [
+        [block for block in blocks if block.type not in image_only_types]
+        for blocks in pages_blocks
+    ]
     raw_pages_blocks = (
         deepcopy(pages_blocks) if _VISUAL_PARENT_DEDUPE else None
     )
@@ -158,6 +217,29 @@ async def _process_decoded_document(
     
     # 3. Phase 2: Reading order and recognition share the OXR service budget.
     semaphore = model_client.get_request_semaphore()
+    recognized_block_total = sum(len(blocks) for blocks in pages_blocks)
+    if progress_callback is not None:
+        await _emit_progress(
+            progress_callback, stage="recognition", label="文字识别", percent=25,
+            detail=f"开始识别 {page_num} 页，共 {recognized_block_total} 个版面区块。",
+            pages_completed=0, page_total=page_num,
+            block_completed=0, block_total=recognized_block_total,
+        )
+
+    async def on_recognition_progress(event: dict[str, int]) -> None:
+        completed_pages = event["pages_completed"]
+        total_pages = event["page_total"]
+        percent = 25 + round(65 * completed_pages / max(total_pages, 1))
+        await _emit_progress(
+            progress_callback, stage="recognition", label="文字识别", percent=percent,
+            detail=(
+                f"页面进度 {completed_pages}/{total_pages} 页；"
+                f"区块进度 {event['block_completed']}/{event['block_total']}。"
+            ),
+            pages_completed=completed_pages, page_total=total_pages,
+            block_completed=event["block_completed"], block_total=event["block_total"],
+        )
+
     recognition_args = (
         pages_blocks,
         images,
@@ -165,6 +247,7 @@ async def _process_decoded_document(
         semaphore,
         model_options,
         element_formats,
+        on_recognition_progress if progress_callback else None,
     )
     async def recognize_body():
         if settings.layout_analyze_model.provides_reading_order:
@@ -193,6 +276,16 @@ async def _process_decoded_document(
     else:
         pages_blocks = await recognize_body()
     recognition_end_time = time.perf_counter()
+    await _emit_progress(
+        progress_callback, stage="assembly", label="整理识别结果", percent=94,
+        detail="文字识别完成，正在整理 Markdown 和 JSON。",
+        pages_completed=page_num, page_total=page_num,
+    )
+    # Empty blocks are omitted, including malformed repeated-zero model output.
+    pages_blocks = [
+        [block for block in blocks if block.content and block.content.strip()]
+        for blocks in pages_blocks
+    ]
 
     # Table pictures have already been restored (or retained in the raster
     # fallback). Remove their top-level duplicates only after applying RO.
@@ -201,7 +294,7 @@ async def _process_decoded_document(
         for blocks in pages_blocks
     ]
 
-    if _SYSTEMATIC_CROSS_CATEGORY_DEDUPE and not full_overlap_dedupe:
+    if _SYSTEMATIC_CROSS_CATEGORY_DEDUPE and text_dedupe and not full_overlap_dedupe:
         pages_blocks = [
             dedupe_systematic_cross_category_blocks(blocks)
             for blocks in pages_blocks
@@ -222,9 +315,26 @@ async def _process_decoded_document(
                 dedupe_visual_parents(raw, blocks, image)
                 for raw, blocks, image in zip(raw_pages_blocks, pages_blocks, images)
             ]
-        if _COMPLETE_TEXT_DEDUPE:
-            pages_blocks = [dedupe_complete_text(blocks) for blocks in pages_blocks]
-        pages_blocks = [dedupe_exact_textual_blocks(blocks) for blocks in pages_blocks]
+        if text_dedupe:
+            if _COMPLETE_TEXT_DEDUPE:
+                pages_blocks = [dedupe_complete_text(blocks) for blocks in pages_blocks]
+            pages_blocks = [dedupe_contained_text_blocks(blocks) for blocks in pages_blocks]
+            pages_blocks = [dedupe_exact_textual_blocks(blocks) for blocks in pages_blocks]
+
+    assign_heading_levels(pages_blocks)
+    stitched_pages = stitch_markdown_pages(
+        pages_blocks,
+        page_heights=[image.shape[0] for image in images],
+        dedupe_text=text_dedupe,
+    )
+    merged_from_previous = [
+        len(stitched) < len(original)
+        or any(
+            merged.content != source.content
+            for merged, source in zip(stitched, original)
+        )
+        for original, stitched in zip(pages_blocks, stitched_pages)
+    ]
 
     pages_blocks = [dedupe_table_edge_text(blocks) for blocks in pages_blocks]
 
@@ -257,13 +367,13 @@ async def _process_decoded_document(
     
     if "json" in output_formats:
         json_pages = []
-        for i, blocks in enumerate(pages_blocks):
+        for i, blocks in enumerate(stitched_pages):
             h, w = images[i].shape[:2]
             serialized_blocks, numbering_notes = serialize_final_blocks(blocks)
             page_data = {
                 "page_num": i,
                 "page_size": {"w": w, "h": h},
-                "merge_content_from_pre_page": False, # Basic placeholder
+                "merge_content_from_pre_page": merged_from_previous[i],
                 "blocks": serialized_blocks,
             }
             if numbering_notes:
@@ -272,7 +382,7 @@ async def _process_decoded_document(
         outputs["json"] = {"pages": json_pages}
         
     if "markdown" in output_formats:
-        outputs["markdown"] = assemble_markdown(pages_blocks)
+        outputs["markdown"] = assemble_markdown(stitched_pages)
         
     end_time = time.perf_counter()
 

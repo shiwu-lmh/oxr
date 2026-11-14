@@ -70,3 +70,27 @@ def test_postprocess_table_sets_markdown_format_when_requested():
 
     assert block.format == ContentFormat.MARKDOWN
     assert block.content == "| A |\n| --- |\n| B |"
+
+
+def test_postprocess_table_attaches_abnormal_arrow_to_result_and_restores_columns():
+    raw = (
+        "<table><thead><tr><th>代号</th><th>项目名称</th><th>结果</th>"
+        "<th>参考区间</th><th>单位</th><th>检测方法</th><th>互认</th></tr></thead>"
+        "<tbody><tr><td>NEU%</td><td>中性粒细胞百分比</td><td>76.2</td>"
+        "<td>↑</td><td>40-75</td><td>%</td><td>计算法</td></tr></tbody></table>"
+    )
+
+    block = postprocess_table(_table_block(), raw)
+
+    assert "<td>76.2 ↑</td><td>40-75</td><td>%</td><td>计算法</td><td></td>" in block.content
+
+
+def test_postprocess_table_does_not_merge_arrows_into_reference_values():
+    raw = (
+        "<table><tr><th>项目</th><th>结果</th><th>参考区间</th></tr>"
+        "<tr><td>某指标</td><td>↑</td><td>0-1</td></tr></table>"
+    )
+
+    block = postprocess_table(_table_block(), raw)
+
+    assert "<td>↑</td><td>0-1</td>" in block.content

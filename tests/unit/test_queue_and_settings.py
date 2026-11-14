@@ -115,6 +115,8 @@ def test_pipeline_full_overlap_dedupe_defaults_to_false():
         "full_overlap_dedupe": False,
         "table_image_placeholders": False,
         "table_image_min_score": 0.5,
+        "verify_text_with_oxr": False,
+        "text_verification_mode": "log",
     }
 
 

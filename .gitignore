@@ -51,3 +51,7 @@ copilot-instructions.md
 .agents/
 .cursor/
 docs/overlap-postprocess-validation.md
+
+# Local OXR model weights and runtime logs
+/models/
+/logs/

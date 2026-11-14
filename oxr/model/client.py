@@ -121,10 +121,7 @@ class OXRModelClient:
             raise ValueError("An image is required for vision model calls.")
 
         content = [
-            {
-                "type": "image_url",
-                "image_url": {"url": self._image_to_data_url(image)},
-            },
+            {"type": "image_url", "image_url": {"url": self._image_to_data_url(image)}},
             {"type": "text", "text": prompt},
         ]
         resolved_options = resolve_model_options(model_options)
@@ -183,84 +180,85 @@ class OXRModelClient:
             model_options=model_options,
         )
 
-    async def recognize_table(self, image: np.ndarray, model_options: Optional[Dict[str, Any]] = None) -> str:
-        from oxr.model.prompts import PROMPT_TABLE_RECOGNITION
-        from oxr.utils.table_image import (
-            merge_table_chunk_outputs,
-            prepare_table_image,
-            split_long_table_image,
+    async def recognize_table(
+        self,
+        image: np.ndarray,
+        model_options: Optional[Dict[str, Any]] = None,
+        *,
+        header_schema: Optional[str] = None,
+        expected_columns: int | None = None,
+    ) -> str:
+        from oxr.model.prompts import (
+            PROMPT_TABLE_RECOGNITION,
+            PROMPT_TABLE_SEGMENT_RECOGNITION,
         )
-        from oxr.utils.table import keep_complete_html_tables
+        if header_schema:
+            prompt = PROMPT_TABLE_SEGMENT_RECOGNITION.format(header_schema=header_schema)
+        else:
+            prompt = PROMPT_TABLE_RECOGNITION
+        if expected_columns:
+            prompt += (
+                f" Every output row must have exactly {expected_columns} logical columns "
+                "after applying rowspan and colspan. Add empty cells at their correct grid positions."
+            )
+        output = await self._call_vision_model(
+            prompt=prompt,
+            image=image,
+            timeout=self.config.timeout,
+            model_options=model_options,
+        )
         from oxr.utils.table_grid_alignment import align_html_table_to_grid
-
-        async def recognize_part(part: np.ndarray) -> ModelOutput:
-            prepared = prepare_table_image(part)
-            async with self.get_request_semaphore():
-                output = await self._call_vision_model(
-                    prompt=PROMPT_TABLE_RECOGNITION,
-                    image=prepared,
-                    timeout=self.config.timeout,
-                    model_options=model_options,
-                )
-            cleaned = keep_complete_html_tables(str(output))
-            aligned = align_html_table_to_grid(part, cleaned)
-            if aligned != cleaned:
-                logger.info("Rebuilt table rows using detected cell grid positions.")
-                cleaned = aligned
-            if cleaned != output:
-                logger.warning("Removed text outside the completed HTML table output.")
-                return ModelOutput(
-                    cleaned,
-                    finish_reason=output.finish_reason,
-                    usage=output.usage,
-                )
-            return output
-
-        chunks = split_long_table_image(image)
-        if len(chunks) == 1:
-            return await recognize_part(chunks[0])
-
-        tasks = [asyncio.create_task(recognize_part(chunk)) for chunk in chunks]
-        try:
-            outputs = await asyncio.gather(*tasks)
-        except BaseException:
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            raise
-
-        merged = merge_table_chunk_outputs([str(output) for output in outputs])
-        if merged is None:
-            logger.warning(
-                "Could not safely merge %s table chunks because their repeated rows differed; "
-                "retrying the original table image.",
-                len(chunks),
+        raw = str(output)
+        aligned = align_html_table_to_grid(image, raw)
+        if aligned != raw:
+            logger.info("Applied table-grid alignment to recognized table headers and cells.")
+            return ModelOutput(
+                aligned,
+                finish_reason=output.finish_reason,
+                usage=output.usage,
             )
-            return await recognize_part(image)
+        return output
 
-        merged_html, merged_rows = merged
-        # Chunk-level geometry can be ambiguous when a crop starts mid-table.
-        # Once the rows are assembled, use the original image to validate
-        # colspans and cell positions across the complete table grid.
-        aligned_merged_html = align_html_table_to_grid(image, merged_html)
-        if aligned_merged_html != merged_html:
-            logger.info(
-                "Applied final table-grid alignment after merging %s chunks.",
-                len(chunks),
+    async def recognize_table_as_text(
+        self,
+        image: np.ndarray,
+        model_options: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Transcribe table rows as plain text when HTML structure cannot be recovered."""
+        from oxr.model.prompts import PROMPT_TABLE_TEXT_RECOGNITION
+        return await self._call_vision_model(
+            prompt=PROMPT_TABLE_TEXT_RECOGNITION,
+            image=image,
+            timeout=self.config.timeout,
+            model_options=model_options,
+        )
+
+    async def recognize_table_cells(
+        self,
+        image: np.ndarray,
+        model_options: Optional[Dict[str, Any]] = None,
+        *,
+        blood_pressure_ids: tuple[int, ...] = (),
+    ) -> str:
+        """Transcribe isolated, numbered cells without relying on row layout."""
+        from oxr.model.prompts import PROMPT_TABLE_CELL_RECOGNITION
+        prompt = PROMPT_TABLE_CELL_RECOGNITION
+        if blood_pressure_ids:
+            labels = ", ".join(f"K{index:04}" for index in blood_pressure_ids)
+            prompt += (
+                f" The following IDs are blood-pressure cells: {labels}. Their narrow printed values "
+                "may wrap onto multiple visual lines. Read top to bottom and join the visible "
+                "characters without inserting punctuation at line breaks. For example, visible "
+                "lines `10`, `4/`, `66` transcribe as `104/66`: only the slash visibly printed "
+                "after 4 is a separator. Do not add or remove any visible digit or slash."
             )
-            merged_html = aligned_merged_html
-        logger.info(
-            "Recognized long table in %s row chunks; assembled %s HTML rows in source order.",
-            len(chunks),
-            merged_rows,
+        return await self._call_vision_model(
+            prompt=prompt,
+            image=image,
+            timeout=self.config.timeout,
+            model_options=model_options,
         )
-        finish_reason = (
-            "length"
-            if any(output.finish_reason == "length" for output in outputs)
-            else "stop"
-        )
-        return ModelOutput(merged_html, finish_reason=finish_reason)
+
 
     async def recognize_code(self, image: np.ndarray, model_options: Optional[Dict[str, Any]] = None) -> str:
         from oxr.model.prompts import PROMPT_CODE_RECOGNITION
@@ -289,6 +287,32 @@ class OXRModelClient:
         from oxr.model.prompts import PROMPT_WHOLE_PAGE_RECOGNITION
         return await self._call_vision_model(
             prompt=PROMPT_WHOLE_PAGE_RECOGNITION,
+            image=image,
+            timeout=self.config.timeout,
+            model_options=model_options,
+        )
+
+    async def verify_page_text(
+        self,
+        image: np.ndarray,
+        recognized_blocks: list[dict[str, str]],
+        model_options: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Ask OXR to check page OCR candidates against the page image."""
+        import json
+
+        prompt = (
+            "Recheck each supplied OCR text block against the visible printed text "
+            "in this full-page image. Use nearby context only to distinguish glyphs "
+            "that are visibly present. Preserve all visible wording, names, numbers, "
+            "punctuation, and line breaks; do not infer or normalize. Return only a "
+            "JSON object mapping each supplied block id to its corrected transcription. "
+            "Include every id exactly once and do not add ids. Use [无法辨认] only "
+            "where the image itself is unreadable.\n\nOCR blocks:\n"
+            + json.dumps(recognized_blocks, ensure_ascii=False)
+        )
+        return await self._call_vision_model(
+            prompt=prompt,
             image=image,
             timeout=self.config.timeout,
             model_options=model_options,

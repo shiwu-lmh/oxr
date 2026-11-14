@@ -30,6 +30,7 @@ class AsyncQueryData(BaseModel):
     result: Optional[Dict[str, Any]] = None
     error: Optional[str]
     metadata: Dict[str, Any]
+    progress: Dict[str, Any] = {}
 
 class AsyncQueryResponse(ResponseBase):
     data: AsyncQueryData

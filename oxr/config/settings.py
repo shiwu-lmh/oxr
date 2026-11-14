@@ -1,5 +1,5 @@
 import os
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -62,9 +62,12 @@ class PipelineConfig(BaseModel):
     model_config = ConfigDict(validate_assignment=True, extra="forbid")
 
     image_output_dir: str = "outputs"
+    text_dedupe: bool = False
     full_overlap_dedupe: bool = False
     table_image_placeholders: bool = False
     table_image_min_score: float = Field(default=0.5, ge=0.0, le=1.0)
+    verify_text_with_oxr: bool = False
+    text_verification_mode: Literal["log", "apply"] = "log"
 
 
 class Settings(BaseSettings):

@@ -1,5 +1,5 @@
 import asyncio
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -52,6 +52,7 @@ async def analyze_layouts(
     *,
     client: Optional[LayoutAnalyzeClient] = None,
     config: Optional[LayoutAnalyzeModelConfig] = None,
+    progress_callback: Optional[Callable[[dict[str, int]], Awaitable[None]]] = None,
 ) -> List[List[Block]]:
     """Analyze page layouts in concurrent, order-preserving service batches."""
     del model_options  # LayoutAnalyzeClient has a fixed structured API.
@@ -73,17 +74,28 @@ async def analyze_layouts(
         for start in range(0, len(images), resolved_config.batch_size)
     ]
     sem = asyncio.Semaphore(resolved_config.max_concurrency)
+    completed_pages = 0
+    progress_lock = asyncio.Lock()
+
+    async def analyze_batch(batch_index, batch, sizes):
+        nonlocal completed_pages
+        result = await process_layout_batch(
+            batch, sizes, sem, batch_index,
+            client=resolved_client, config=resolved_config,
+        )
+        if progress_callback is not None:
+            async with progress_lock:
+                completed_pages += len(batch)
+                await progress_callback({
+                    "completed_pages": completed_pages,
+                    "total_pages": len(images),
+                })
+        return result
+
     try:
         batch_results = await gather_cancel_on_error(
             *(
-                process_layout_batch(
-                    batch,
-                    sizes,
-                    sem,
-                    batch_index,
-                    client=resolved_client,
-                    config=resolved_config,
-                )
+                analyze_batch(batch_index, batch, sizes)
                 for batch_index, (batch, sizes) in enumerate(batches)
             )
         )
