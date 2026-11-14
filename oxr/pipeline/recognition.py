@@ -100,7 +100,15 @@ async def recognize_block(
     element_formats: Optional[Dict[str, str]] = None,
     table_images: Optional[List[Block]] = None,
 ) -> Block:
-    crop_img = crop_image(page_image, block.bbox)
+    crop_bbox = block.bbox
+    if block.type == BlockType.TABLE:
+        x1, y1, x2, y2 = block.bbox
+        # Layout boxes can stop just inside the outer table rules. Preserve a
+        # small page margin so grid-based colspan correction can see those
+        # boundary lines in the recognition crop.
+        margin = max(12, min(24, round(min(x2 - x1, y2 - y1) * 0.01)))
+        crop_bbox = [x1 - margin, y1 - margin, x2 + margin, y2 + margin]
+    crop_img = crop_image(page_image, crop_bbox)
     element_formats = element_formats or {}
 
     if block.type == BlockType.PICTURE:

@@ -240,6 +240,16 @@ class OXRModelClient:
             return await recognize_part(image)
 
         merged_html, merged_rows = merged
+        # Chunk-level geometry can be ambiguous when a crop starts mid-table.
+        # Once the rows are assembled, use the original image to validate
+        # colspans and cell positions across the complete table grid.
+        aligned_merged_html = align_html_table_to_grid(image, merged_html)
+        if aligned_merged_html != merged_html:
+            logger.info(
+                "Applied final table-grid alignment after merging %s chunks.",
+                len(chunks),
+            )
+            merged_html = aligned_merged_html
         logger.info(
             "Recognized long table in %s row chunks; assembled %s HTML rows in source order.",
             len(chunks),

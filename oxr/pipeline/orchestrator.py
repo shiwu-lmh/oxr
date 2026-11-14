@@ -31,7 +31,10 @@ from oxr.pipeline.postprocess.overlap_dedupe import (
     dedupe_complete_text,
 )
 from oxr.pipeline.postprocess.exact_text_dedupe import dedupe_exact_textual_blocks
-from oxr.pipeline.postprocess.full_overlap_dedupe import dedupe_full_overlaps
+from oxr.pipeline.postprocess.full_overlap_dedupe import (
+    dedupe_full_overlaps,
+    dedupe_table_edge_text,
+)
 from oxr.pipeline.postprocess.table_images import TABLE_IMAGE_ROLE
 
 
@@ -222,6 +225,8 @@ async def _process_decoded_document(
         if _COMPLETE_TEXT_DEDUPE:
             pages_blocks = [dedupe_complete_text(blocks) for blocks in pages_blocks]
         pages_blocks = [dedupe_exact_textual_blocks(blocks) for blocks in pages_blocks]
+
+    pages_blocks = [dedupe_table_edge_text(blocks) for blocks in pages_blocks]
 
     if demo and keep_header_footer:
         for page_index, (blocks, margins) in enumerate(zip(pages_blocks, demo_page_margins)):

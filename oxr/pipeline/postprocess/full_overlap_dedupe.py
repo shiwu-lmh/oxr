@@ -56,6 +56,56 @@ def _overlaps(a: list[float], b: list[float]) -> bool:
     intersection = max(0.0, min(a[2], b[2]) - max(a[0], b[0])) * max(
         0.0, min(a[3], b[3]) - max(a[1], b[1])
     )
+
+
+def _table_absorbs_edge_text(table: Block, text: Block) -> bool:
+    """Drop a narrow, full-height text strip duplicated inside a table edge."""
+    if (
+        table.type != BlockType.TABLE
+        or text.type != BlockType.TEXT
+        or not table.content.strip()
+        or not _valid_box(table.bbox)
+        or not _valid_box(text.bbox)
+    ):
+        return False
+
+    tx1, ty1, tx2, ty2 = table.bbox
+    x1, y1, x2, y2 = text.bbox
+    table_width, table_height = tx2 - tx1, ty2 - ty1
+    text_width, text_height = x2 - x1, y2 - y1
+    if table_width <= 0 or table_height <= 0 or text_width <= 0 or text_height <= 0:
+        return False
+
+    intersection = max(0.0, min(tx2, x2) - max(tx1, x1)) * max(
+        0.0, min(ty2, y2) - max(ty1, y1)
+    )
+    text_coverage = intersection / max(text_width * text_height, 1e-9)
+    vertical_coverage = max(0.0, min(ty2, y2) - max(ty1, y1)) / text_height
+    edge_tolerance = max(8.0, table_width * 0.005)
+    hugs_vertical_edge = (
+        abs(x1 - tx1) <= edge_tolerance
+        or abs(x2 - tx2) <= edge_tolerance
+    )
+
+    return (
+        text_width <= table_width * 0.05
+        and text_height >= table_height * 0.75
+        and text_coverage >= 0.80
+        and vertical_coverage >= 0.95
+        and hugs_vertical_edge
+    )
+
+
+def dedupe_table_edge_text(blocks: list[Block]) -> list[Block]:
+    """Remove recognized text strips that duplicate a table's outer column."""
+    tables = [block for block in blocks if block.type == BlockType.TABLE]
+    removed = {
+        id(text)
+        for text in blocks
+        if text.type == BlockType.TEXT
+        and any(_table_absorbs_edge_text(table, text) for table in tables)
+    }
+    return [block for block in blocks if id(block) not in removed]
     area_a = (a[2] - a[0]) * (a[3] - a[1])
     area_b = (b[2] - b[0]) * (b[3] - b[1])
     return (
@@ -132,6 +182,8 @@ def _preserves_content(winner: Block, loser: Block, image: np.ndarray | None) ->
 
 
 def _absorbs(parent: Block, child: Block, image: np.ndarray | None) -> bool:
+    if _table_absorbs_edge_text(parent, child):
+        return True
     if _contains(parent.bbox, child.bbox):
         return _unprotected_textual_pair(parent, child) or _preserves_content(parent, child, image)
     # Near-containment scales with the child text height. Ordinary text must
