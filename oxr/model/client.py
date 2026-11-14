@@ -191,6 +191,7 @@ class OXRModelClient:
             split_long_table_image,
         )
         from oxr.utils.table import keep_complete_html_tables
+        from oxr.utils.table_grid_alignment import align_html_table_to_grid
 
         async def recognize_part(part: np.ndarray) -> ModelOutput:
             prepared = prepare_table_image(part)
@@ -202,6 +203,10 @@ class OXRModelClient:
                     model_options=model_options,
                 )
             cleaned = keep_complete_html_tables(str(output))
+            aligned = align_html_table_to_grid(part, cleaned)
+            if aligned != cleaned:
+                logger.info("Rebuilt table rows using detected cell grid positions.")
+                cleaned = aligned
             if cleaned != output:
                 logger.warning("Removed text outside the completed HTML table output.")
                 return ModelOutput(
