@@ -27,6 +27,9 @@
                 <button class="icon-btn" id="download-button" type="button" disabled aria-label="Download Markdown" title="Download Markdown">
                     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"></path><path d="m7 10 5 5 5-5"></path><path d="M5 21h14"></path></svg>
                 </button>
+                <button class="icon-btn" id="download-json-button" type="button" disabled aria-label="Download JSON" title="Download JSON">
+                    <span aria-hidden="true">JSON</span>
+                </button>
             </div>
         </header>
         <div class="markdown-content" id="markdown-content">
@@ -158,7 +161,7 @@
     <div class="parse-progress" id="parse-progress" role="status" aria-live="polite" aria-atomic="true" hidden>
         <ol class="progress-tree" aria-label="Document progress">
             <li class="progress-step" id="upload-step"><span class="progress-node" aria-hidden="true"></span><span id="upload-progress-label">Uploading...</span></li>
-            <li class="progress-step" id="parse-step"><span class="progress-node" aria-hidden="true"></span><span>Parsing...</span></li>
+            <li class="progress-step" id="parse-step"><span class="progress-node" aria-hidden="true"></span><span id="parse-progress-label">Preparing document...</span></li>
         </ol>
     </div>
     <script src="/demo/assets/vendor/somarkdown/somarkdown.umd.min.js"></script>

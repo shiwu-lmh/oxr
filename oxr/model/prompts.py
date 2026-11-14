@@ -7,7 +7,7 @@ PROMPT_TEXT_RECOGNITION = """Recognize the content of the image."""
 
 PROMPT_FORMULA_RECOGNITION = """Recognize the formula of the image into KaTex format."""
 
-PROMPT_TABLE_RECOGNITION = """Recognize the table of the image into html format."""
+PROMPT_TABLE_RECOGNITION = """Transcribe the visible table into HTML only. Preserve the original row order and column order exactly. Keep every visual row as its own <tr>, and keep every visual cell in its original column as a <td> or <th>. Do not join adjacent rows into one string, reorder rows, duplicate rows, or infer values that are not legible. Preserve merged cells only when they are visibly merged; represent blank cells as empty cells. Keep all visible text, numbers, symbols, dates, and units exactly as shown."""
 
 PROMPT_CODE_RECOGNITION = """Recognize the code of the image into markdown code format."""
 

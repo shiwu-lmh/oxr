@@ -10,6 +10,7 @@ const resultViewports = [$("rendered-viewport"), $("source-viewport"), $("layout
 const renderer = createRenderer();
 let pages = [];
 let markdown = "";
+let jsonOutput = null;
 let fileName = "document";
 let lastFile = null;
 let activeTab = "rendered";
@@ -26,7 +27,7 @@ const sync = new PageSync(fileViewport, resultViewports, (page) => {
 });
 initSplitter($("document-panels"), $("markdown-splitter"));
 
-function setProgress(stage) {
+function setProgress(stage, detail = "") {
     isLoading = Boolean(stage);
     if (isLoading) clearFileDrag();
     $("app-container").inert = isLoading;
@@ -35,6 +36,19 @@ function setProgress(stage) {
     $("upload-step").className = `progress-step ${stage === "upload" ? "active" : "complete"}`;
     $("upload-progress-label").textContent = stage === "upload" ? "Uploading..." : "Uploaded.";
     $("parse-step").className = `progress-step${stage === "parse" ? " active" : ""}`;
+    if (stage === "parse" && detail) $("parse-progress-label").textContent = detail;
+}
+
+function progressMessage(status) {
+    if (status.status === "queued") return "Queued for processing...";
+    if (status.status === "rendering") return "Preparing page images...";
+    if (status.status === "processing") {
+        const count = status.pages?.length;
+        return Number.isInteger(count) && count > 0
+            ? `Processing document · ${count} page${count === 1 ? "" : "s"}`
+            : "Processing document...";
+    }
+    return "Finishing results...";
 }
 
 async function request(url, options = {}) {
@@ -124,6 +138,7 @@ function updatePageImages(incoming) {
 
 function showResult(result) {
     markdown = String(result.outputs?.markdown || "");
+    jsonOutput = result.outputs?.json ?? null;
     const images = new Map(pages.map((page) => [page.page_num, page]));
     pages = (result.demo_pages || []).map((page) => ({ ...images.get(page.page_num), ...page, keep_header_footer: result.metadata?.keep_header_footer === true })).sort((a, b) => a.page_num - b.page_num);
     if (!pages.length) throw new Error("The server returned no document pages.");
@@ -211,6 +226,7 @@ function showResult(result) {
     resultViewports.forEach((viewport, index) => viewport.replaceChildren(fragments[index]));
     resultReady = true;
     $("download-button").disabled = false;
+    $("download-json-button").disabled = jsonOutput === null;
     sync.setPage(Math.min(sync.page, pages.length - 1));
 }
 
@@ -275,11 +291,13 @@ async function upload(file) {
     lastFile = file;
     pages = [];
     markdown = "";
+    jsonOutput = null;
     selectedKey = null;
     imageSignature = "";
     resultReady = false;
     blockMap.clear();
     $("download-button").disabled = true;
+    $("download-json-button").disabled = true;
     $("file-pages").replaceChildren();
     $("upload-dropzone").hidden = false;
     $("page-count").textContent = "";
@@ -299,11 +317,12 @@ async function upload(file) {
         for (const [key, value] of Object.entries(parsingOptions)) form.append(key, String(value));
         const job = await request("/v1/demo/jobs", { method: "POST", body: form });
         if (currentGeneration !== generation) return;
-        setProgress("parse");
+    setProgress("parse", "Preparing document...");
         let delay = 650;
         while (currentGeneration === generation) {
             const status = await request(`/v1/demo/jobs/${encodeURIComponent(job.id)}`);
             if (currentGeneration !== generation) return;
+            setProgress("parse", progressMessage(status));
             updatePageImages(status.pages || []);
             updateStatusPages(status.pages?.length);
             if (status.status === "failed") throw new Error(typeof status.error === "string" ? status.error : status.error?.message || "Document parsing failed.");
@@ -399,6 +418,21 @@ $("download-button").addEventListener("click", () => {
     const anchor = document.createElement("a");
     anchor.href = url;
     anchor.download = `${fileName.replace(/\.[^.]+$/, "") || "document"}.md`;
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+});
+
+$("download-json-button").addEventListener("click", () => {
+    if (!resultReady || jsonOutput === null) return;
+    const content = typeof jsonOutput === "string"
+        ? jsonOutput
+        : JSON.stringify(jsonOutput, null, 2);
+    const url = URL.createObjectURL(new Blob([content], { type: "application/json;charset=utf-8" }));
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `${fileName.replace(/\.[^.]+$/, "") || "document"}.json`;
     document.body.append(anchor);
     anchor.click();
     anchor.remove();

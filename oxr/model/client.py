@@ -185,12 +185,67 @@ class OXRModelClient:
 
     async def recognize_table(self, image: np.ndarray, model_options: Optional[Dict[str, Any]] = None) -> str:
         from oxr.model.prompts import PROMPT_TABLE_RECOGNITION
-        return await self._call_vision_model(
-            prompt=PROMPT_TABLE_RECOGNITION,
-            image=image,
-            timeout=self.config.timeout,
-            model_options=model_options,
+        from oxr.utils.table_image import (
+            merge_table_chunk_outputs,
+            prepare_table_image,
+            split_long_table_image,
         )
+        from oxr.utils.table import keep_complete_html_tables
+
+        async def recognize_part(part: np.ndarray) -> ModelOutput:
+            prepared = prepare_table_image(part)
+            async with self.get_request_semaphore():
+                output = await self._call_vision_model(
+                    prompt=PROMPT_TABLE_RECOGNITION,
+                    image=prepared,
+                    timeout=self.config.timeout,
+                    model_options=model_options,
+                )
+            cleaned = keep_complete_html_tables(str(output))
+            if cleaned != output:
+                logger.warning("Removed text outside the completed HTML table output.")
+                return ModelOutput(
+                    cleaned,
+                    finish_reason=output.finish_reason,
+                    usage=output.usage,
+                )
+            return output
+
+        chunks = split_long_table_image(image)
+        if len(chunks) == 1:
+            return await recognize_part(chunks[0])
+
+        tasks = [asyncio.create_task(recognize_part(chunk)) for chunk in chunks]
+        try:
+            outputs = await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+        merged = merge_table_chunk_outputs([str(output) for output in outputs])
+        if merged is None:
+            logger.warning(
+                "Could not safely merge %s table chunks because their repeated rows differed; "
+                "retrying the original table image.",
+                len(chunks),
+            )
+            return await recognize_part(image)
+
+        merged_html, merged_rows = merged
+        logger.info(
+            "Recognized long table in %s row chunks; assembled %s HTML rows in source order.",
+            len(chunks),
+            merged_rows,
+        )
+        finish_reason = (
+            "length"
+            if any(output.finish_reason == "length" for output in outputs)
+            else "stop"
+        )
+        return ModelOutput(merged_html, finish_reason=finish_reason)
 
     async def recognize_code(self, image: np.ndarray, model_options: Optional[Dict[str, Any]] = None) -> str:
         from oxr.model.prompts import PROMPT_CODE_RECOGNITION

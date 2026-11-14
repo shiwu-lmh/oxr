@@ -15,6 +15,7 @@ from oxr.pipeline.postprocess.chemical_structure_postprocess import (
 from oxr.pipeline.postprocess.code_postprocess import postprocess_code
 from oxr.pipeline.postprocess.formula_postprocess import postprocess_formula
 from oxr.pipeline.postprocess.picture_postprocess import postprocess_picture
+from oxr.pipeline.postprocess.repetition_postprocess import postprocess_repetition_loops
 from oxr.pipeline.postprocess.table_postprocess import postprocess_table
 from oxr.pipeline.postprocess.table_images import (
     group_table_images, mark_table_images, prepare_table_images,
@@ -73,9 +74,10 @@ async def _request_block(
     sem: asyncio.Semaphore,
     model_options: Optional[Dict[str, Any]],
 ) -> str:
+    if block.type == BlockType.TABLE:
+        # recognize_table handles bounded parallelism for its row-aligned chunks.
+        return await model_client.recognize_table(crop_img, model_options)
     async with sem:
-        if block.type == BlockType.TABLE:
-            return await model_client.recognize_table(crop_img, model_options)
         if block.type == BlockType.FORMULA:
             return await model_client.recognize_formula(crop_img, model_options)
         if block.type == BlockType.CODE_BLOCK:
@@ -195,6 +197,11 @@ async def recognize_block(
                     block.type.value,
                     recovery_method,
                 )
+
+    if block.type != BlockType.TABLE:
+        # Normalize OCR loops before type-specific formatting so text, formulas,
+        # code, and other textual recognizers all receive the same cleanup.
+        raw_out = postprocess_repetition_loops(raw_out)
 
     if block.type == BlockType.TABLE:
         if table_images:
